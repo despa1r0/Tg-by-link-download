@@ -17,8 +17,36 @@ def _is_tiktok_url(url: str) -> bool:
     return 'tiktok.com' in url
 
 
+def _is_tiktok_short_url(url: str) -> bool:
+    """Check if this is a shortened TikTok URL that needs redirect resolution."""
+    return any(domain in url for domain in ('vt.tiktok.com', 'vm.tiktok.com'))
+
+
+def _resolve_tiktok_url(url: str) -> str:
+    """
+    Follow redirects on short TikTok URLs (vt.tiktok.com, vm.tiktok.com)
+    to get the real tiktok.com/@user/video|photo/ID URL.
+    Returns the resolved URL, or the original if resolution fails.
+    """
+    if not _is_tiktok_short_url(url):
+        return url
+    req = urllib.request.Request(url, headers={
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        ),
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return resp.url  # final URL after redirects
+    except Exception:
+        return url
+
+
 def _normalise_tiktok_url(url: str) -> str:
-    """Convert /photo/ URLs to /video/ so TikTok serves the page data."""
+    """Resolve short URLs and convert /photo/ to /video/ so TikTok serves page data."""
+    url = _resolve_tiktok_url(url)
     return url.replace('/photo/', '/video/')
 
 
@@ -42,37 +70,79 @@ def _extract_tiktok_photos(url: str) -> list[str] | None:
         print(f"TikTok page fetch error: {e}")
         return None
 
-    # Parse the embedded JSON
-    match = re.search(
-        r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
-        html, re.DOTALL,
-    )
-    if not match:
+    # Try multiple embedded JSON script tags that TikTok uses
+    script_ids = [
+        '__UNIVERSAL_DATA_FOR_REHYDRATION__',
+        'SIGI_STATE',
+        '__NEXT_DATA__',
+    ]
+    data = None
+    for sid in script_ids:
+        pattern = rf'<script[^>]*id="{sid}"[^>]*>(.*?)</script>'
+        match = re.search(pattern, html, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                break
+            except json.JSONDecodeError:
+                continue
+
+    # Also try to find any large JSON blob in script tags
+    if data is None:
+        for match in re.finditer(r'<script[^>]*>((\{.{500,}?\}))</script>', html, re.DOTALL):
+            try:
+                data = json.loads(match.group(1))
+                break
+            except json.JSONDecodeError:
+                continue
+
+    if data is None:
         return None
 
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError:
+    # Recursively search the entire JSON tree for 'imagePost' containing 'images'
+    photos = _find_image_post(data)
+    return photos if photos else None
+
+
+def _find_image_post(obj, depth=0) -> list[str] | None:
+    """
+    Recursively walks a JSON structure looking for an 'imagePost' key
+    that contains an 'images' list with image URLs.
+    """
+    if depth > 15:  # prevent infinite recursion
         return None
 
-    default_scope = data.get('__DEFAULT_SCOPE__', {})
-    detail = default_scope.get('webapp.video-detail', {})
-    item_struct = detail.get('itemInfo', {}).get('itemStruct', {})
-    image_post = item_struct.get('imagePost', {})
+    if isinstance(obj, dict):
+        # Check if THIS dict has 'imagePost'
+        image_post = obj.get('imagePost')
+        if isinstance(image_post, dict):
+            images = image_post.get('images', [])
+            if isinstance(images, list) and images:
+                urls = []
+                for img in images:
+                    url_list = (
+                        img.get('imageURL', {}).get('urlList', [])
+                        or img.get('displayImage', {}).get('urlList', [])
+                        or img.get('ownerWatermarkImage', {}).get('urlList', [])
+                    )
+                    if url_list:
+                        urls.append(url_list[0])
+                if urls:
+                    return urls
 
-    if not image_post:
-        return None
+        # Recurse into all values
+        for v in obj.values():
+            result = _find_image_post(v, depth + 1)
+            if result:
+                return result
 
-    images = image_post.get('images', [])
-    if not images:
-        return None
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_image_post(item, depth + 1)
+            if result:
+                return result
 
-    urls = []
-    for img in images:
-        url_list = img.get('imageURL', {}).get('urlList', [])
-        if url_list:
-            urls.append(url_list[0])  # first CDN mirror
-    return urls if urls else None
+    return None
 
 
 def _download_image(image_url: str, dest_path: str) -> bool:
@@ -129,7 +199,28 @@ async def extract_info(url: str) -> dict | None:
                 print(f"Info extract error: {e}")
                 return None
 
-    return await loop.run_in_executor(None, _extract)
+    info = await loop.run_in_executor(None, _extract)
+
+    # Fallback: if yt-dlp returned audio-only for a TikTok URL, it's a photo post.
+    # The HTML scraper may have missed it, but we can still detect it here.
+    if info and _is_tiktok_url(url):
+        vcodec = info.get('vcodec', '')
+        has_video = vcodec and vcodec != 'none'
+        if not has_video:
+            # It's a photo post that our scraper missed.
+            # Use thumbnail URLs as a fallback (at least gives the cover images).
+            thumb_urls = []
+            for t in info.get('thumbnails', []):
+                t_url = t.get('url', '')
+                if t_url and t_url not in thumb_urls:
+                    thumb_urls.append(t_url)
+            if thumb_urls:
+                return {
+                    '_tiktok_photos': thumb_urls,
+                    'extractor_key': 'TikTok',
+                }
+
+    return info
 
 
 def is_gallery(info: dict) -> bool:

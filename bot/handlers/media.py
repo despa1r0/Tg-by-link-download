@@ -263,6 +263,9 @@ async def handle_link(message: Message, state: FSMContext):
         await state.update_data(gallery_count=count, gallery_cache_id=cache_id)
         return
 
+    # Store video duration for later (GIF auto-convert for short videos)
+    duration = info.get('duration') if info else None
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎥 Download Video", callback_data="dl_video")],
         [InlineKeyboardButton(text="🎵 Download Audio", callback_data="dl_audio")],
@@ -271,6 +274,8 @@ async def handle_link(message: Message, state: FSMContext):
     ])
     await msg.edit_text("Link detected! Choose an action:", reply_markup=keyboard)
     url_cache[msg.message_id] = text
+    if duration:
+        await state.update_data(video_duration=duration)
 
 
 @router.message(F.video, StateFilter(None))
@@ -393,9 +398,41 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
 
     # ── GIF from link ──
     if action == "gif":
+        data = await state.get_data()
+        duration = data.get("video_duration")
+
+        # Short video (≤10s) — convert the whole thing, no need to ask
+        if duration and duration <= 10:
+            await callback.message.edit_text(
+                f"Video is only {duration}s — converting the full video to GIF… ⏳"
+            )
+            files = await download_media(url, "video")
+            filepath = files[0] if files else None
+            if not filepath:
+                await callback.message.edit_text("Failed to download video.")
+                return
+            gif_path = await convert_to_gif(filepath, "0", str(duration))
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            if not gif_path:
+                await callback.message.edit_text("Failed to convert video to GIF.")
+                return
+            try:
+                await callback.message.answer_animation(FSInputFile(gif_path))
+                await callback.message.edit_text("Done! ✅")
+            except Exception:
+                await callback.message.edit_text("Failed to send GIF. It might be too large.")
+            finally:
+                if os.path.exists(gif_path):
+                    os.remove(gif_path)
+            return
+
+        # Longer video — ask for timestamps
         await state.update_data(url=url)
         await state.set_state(BotStates.waiting_for_gif_timestamps)
+        duration_text = f"The video is **{duration}s** long.\n" if duration else ""
         await callback.message.edit_text(
+            f"{duration_text}"
             "Reply with the time range for the GIF.\n"
             "Format: `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
             "Keep it under 10 seconds for best results.",
