@@ -451,12 +451,17 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     try:
-        if action == "video":
-            await callback.message.answer_video(FSInputFile(filepath))
-        else:
+        # Detect actual file type by extension to select the proper send method
+        ext = filepath.lower().split('.')[-1]
+        if ext in ('jpg', 'jpeg', 'png', 'webp'):
+            await callback.message.answer_photo(FSInputFile(filepath))
+        elif ext in ('mp3', 'm4a', 'wav', 'ogg') or action == "audio":
             await callback.message.answer_audio(FSInputFile(filepath))
+        else:
+            await callback.message.answer_video(FSInputFile(filepath))
         await callback.message.edit_text("Done! ✅")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error sending downloaded file: {e}")
         await callback.message.edit_text("Failed to send file. It might be over Telegram's 50MB limit.")
     finally:
         if os.path.exists(filepath):

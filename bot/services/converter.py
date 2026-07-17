@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str | None:
     """
-    Converts a segment of a video to a GIF.
+    Converts a segment of a video to a high-quality GIF.
+    Uses custom palette generation (palettegen/paletteuse) to preserve color quality.
     start_time and end_time can be plain seconds ('1', '6') or 'MM:SS' / 'HH:MM:SS'.
     Returns the output path on success, or None on failure.
     """
@@ -23,12 +24,22 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
 
     def _convert():
         try:
-            (
+            # High-quality GIF creation in ffmpeg:
+            # We take the input, seek/slice it, apply fps/scale,
+            # split it to generate a custom 256-color palette based on the video frames,
+            # and then apply that palette to render the final GIF.
+            input_video = (
                 ffmpeg
                 .input(input_path, ss=start_time, to=end_time)
-                .filter('fps', fps=10)
-                .filter('scale', 480, -1)  # 480px wide, keep aspect ratio
-                .output(output_path, f='gif')
+                .filter('fps', fps=12)
+                .filter('scale', 480, -1)
+            )
+            split = input_video.filter_multi_output('split')
+            palette = split[0].filter('palettegen')
+            (
+                ffmpeg
+                .filter([split[1], palette], 'paletteuse')
+                .output(output_path)
                 .overwrite_output()
                 .run(quiet=True)
             )
