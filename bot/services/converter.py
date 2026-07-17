@@ -28,6 +28,6 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
             print(f"FFmpeg error: {e.stderr}")
             return None
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _convert)
     return result

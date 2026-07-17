@@ -1,6 +1,7 @@
 from aiogram import Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
 
 router = Router()
 
@@ -23,6 +24,16 @@ async def cmd_help(message: Message):
         "Send me a link to a video or post.\n"
         "Supported sites: YouTube, TikTok, Instagram, Twitter.\n"
         "You can choose to download video, audio, or convert it to a GIF.\n\n"
-        "You can also upload a video directly to convert it to a GIF!"
+        "You can also upload a video directly to convert it to a GIF!\n"
+        "Send /cancel at any time to abort the current action."
     )
     await message.answer(text)
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current is None:
+        await message.answer("Nothing to cancel.")
+        return
+    await state.clear()
+    await message.answer("Action cancelled. ✅\nSend a link or video to start again.")
