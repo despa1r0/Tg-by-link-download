@@ -10,7 +10,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import StateFilter
 
-from bot.services.downloader import download_media, extract_info, is_gallery, get_gallery_count
+from bot.services.downloader import (
+    download_media, extract_info, is_gallery, get_gallery_count,
+    download_tiktok_photos,
+)
 from bot.services.converter import convert_to_gif
 from bot.config import DOWNLOADS_DIR
 
@@ -26,10 +29,25 @@ class BotStates(StatesGroup):
 
 
 url_cache: dict[int, str] = {}
+# Stores TikTok photo URLs when a gallery is detected
+gallery_cache: dict[int, list[str]] = {}
 
 
 def is_valid_url(text: str) -> bool:
     return text.startswith("http://") or text.startswith("https://")
+
+
+def parse_time_to_seconds(t: str) -> int:
+    """Convert a timestamp like '1', '01:30', '1:05:30' to total seconds."""
+    parts = t.split(':')
+    parts = [int(p) for p in parts]
+    if len(parts) == 1:
+        return parts[0]
+    elif len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    elif len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return 0
 
 
 # ──────────────────────────────────────────────────────────
@@ -45,11 +63,19 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
     match = re.match(r"^([\d:]+)\s*-\s*([\d:]+)$", text)
     if not match:
         await message.answer(
-            "Invalid format. Please use `START-END` (e.g. `00:15-00:25`).\nTry again or send /cancel."
+            "Invalid format. Please use `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
+            "Try again or send /cancel."
         )
         return
 
     start_time, end_time = match.groups()
+
+    # Validate that end > start
+    start_sec = parse_time_to_seconds(start_time)
+    end_sec = parse_time_to_seconds(end_time)
+    if end_sec <= start_sec:
+        await message.answer("End time must be after start time. Try again.")
+        return
 
     # Read data BEFORE clearing state
     data = await state.get_data()
@@ -82,7 +108,7 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
     try:
         await message.answer_animation(FSInputFile(gif_path))
         await status_msg.edit_text("Done! ✅")
-    except Exception as e:
+    except Exception:
         await status_msg.edit_text("Failed to send GIF. It might be too large.")
     finally:
         if os.path.exists(gif_path):
@@ -97,11 +123,19 @@ async def process_video_timestamps(message: Message, state: FSMContext):
     match = re.match(r"^([\d:]+)\s*-\s*([\d:]+)$", text)
     if not match:
         await message.answer(
-            "Invalid format. Please use `START-END` (e.g. `00:15-00:25`).\nTry again or send /cancel."
+            "Invalid format. Please use `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
+            "Try again or send /cancel."
         )
         return
 
     start_time, end_time = match.groups()
+
+    start_sec = parse_time_to_seconds(start_time)
+    end_sec = parse_time_to_seconds(end_time)
+    if end_sec <= start_sec:
+        await message.answer("End time must be after start time. Try again.")
+        return
+
     data = await state.get_data()
     file_id = data.get("file_id")
     await state.clear()
@@ -116,17 +150,18 @@ async def process_gallery_selection(message: Message, state: FSMContext):
     data = await state.get_data()
     url = data.get("url")
     total = data.get("gallery_count", 0)
+    cache_id = data.get("gallery_cache_id")
+    photo_urls = gallery_cache.get(cache_id, []) if cache_id else []
     await state.clear()
 
     if not url:
         await message.answer("Session expired. Please send the link again.")
         return
 
-    # Parse the user input:  "1,3,5"  or  "1-3"  or  "all"
+    # Parse the user input:  "1,3" or "1-3" or "all"
     if text == "all":
-        playlist_items = None  # download everything
+        indices = None  # download everything
     else:
-        # Accept comma-separated numbers and/or ranges like "1-3,5"
         parts = [p.strip() for p in text.replace(" ", ",").split(",") if p.strip()]
         nums = []
         for part in parts:
@@ -139,16 +174,28 @@ async def process_gallery_selection(message: Message, state: FSMContext):
         if not nums:
             await message.answer(
                 "Could not understand your selection.\n"
-                "Send numbers like `1,3,5` or `1-3` or `all`."
+                "Send numbers like `1,3` or `1-3` or `all`."
             )
-            # re-enter the state so they can try again
-            await state.update_data(url=url, gallery_count=total)
+            # Re-enter the state so they can try again
+            await state.update_data(url=url, gallery_count=total, gallery_cache_id=cache_id)
             await state.set_state(BotStates.waiting_for_gallery_selection)
+            if cache_id:
+                gallery_cache[cache_id] = photo_urls
             return
-        playlist_items = ",".join(str(n) for n in sorted(set(nums)))
+        indices = sorted(set(nums))
 
     status_msg = await message.answer("Downloading selected photos… ⏳")
-    files = await download_media(url, "gallery", playlist_items=playlist_items)
+
+    # Use TikTok direct download if we have photo URLs cached
+    if photo_urls:
+        files = await download_tiktok_photos(photo_urls, indices)
+    else:
+        playlist_items = ",".join(str(n) for n in indices) if indices else None
+        files = await download_media(url, "gallery", playlist_items=playlist_items)
+
+    # Clean up gallery cache
+    if cache_id and cache_id in gallery_cache:
+        del gallery_cache[cache_id]
 
     if not files:
         await status_msg.edit_text("Failed to download photos.")
@@ -163,7 +210,6 @@ async def process_gallery_selection(message: Message, state: FSMContext):
                 media_group.append(InputMediaVideo(media=FSInputFile(f)))
 
         if media_group:
-            # Telegram allows max 10 items per media group
             for i in range(0, len(media_group), 10):
                 await message.answer_media_group(media_group[i:i + 10])
 
@@ -195,19 +241,26 @@ async def handle_link(message: Message, state: FSMContext):
 
     if info and is_gallery(info):
         count = get_gallery_count(info)
+
+        # Cache TikTok photo URLs for later download
+        cache_id = None
+        tiktok_photos = info.get('_tiktok_photos')
+        if tiktok_photos:
+            cache_id = msg.message_id
+            gallery_cache[cache_id] = tiktok_photos
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📸 Download All", callback_data="dl_gallery_all")],
+            [InlineKeyboardButton(text="📸 Download All Photos", callback_data="dl_gallery_all")],
             [InlineKeyboardButton(text="🔢 Pick Specific Photos", callback_data="dl_gallery_pick")],
             [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
         ])
         await msg.edit_text(
-            f"📷 Gallery detected with **{count}** photos!\nChoose an action:",
+            f"📷 Photo gallery detected — **{count}** photos!\nChoose an action:",
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
         url_cache[msg.message_id] = text
-        # store gallery count for later
-        await state.update_data(gallery_count=count)
+        await state.update_data(gallery_count=count, gallery_cache_id=cache_id)
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -252,7 +305,7 @@ async def handle_video_convert_callback(callback: CallbackQuery, state: FSMConte
         await callback.message.edit_text(
             f"The video is **{video.duration}s** long.\n"
             "Please reply with the time range for the GIF.\n"
-            "Format: `START-END` (e.g. `00:15-00:25` or `15-25`).",
+            "Format: `START-END` (e.g. `00:15-00:25` or `1-6`).",
             parse_mode="Markdown",
         )
     else:
@@ -265,7 +318,7 @@ async def handle_video_convert_callback(callback: CallbackQuery, state: FSMConte
 @router.callback_query(F.data.startswith("dl_"))
 async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     """Callback for link-based actions (download video/audio/gif, gallery, cancel)."""
-    raw = callback.data  # e.g. "dl_video", "dl_gallery_all", "dl_cancel"
+    raw = callback.data
     parts = raw.split("_")
     action = parts[1]
     message_id = callback.message.message_id
@@ -275,6 +328,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     if action == "cancel":
         await callback.message.edit_text("Action cancelled.")
         url_cache.pop(message_id, None)
+        gallery_cache.pop(message_id, None)
         await state.clear()
         return
 
@@ -285,25 +339,37 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     # ── Gallery ──
     if action == "gallery":
         sub_action = parts[2] if len(parts) > 2 else "all"
+        data = await state.get_data()
+        cache_id = data.get("gallery_cache_id")
+        photo_urls = gallery_cache.get(cache_id, []) if cache_id else []
 
         if sub_action == "pick":
-            data = await state.get_data()
             count = data.get("gallery_count", "?")
             await state.update_data(url=url)
             await state.set_state(BotStates.waiting_for_gallery_selection)
             await callback.message.edit_text(
                 f"There are **{count}** photos.\n"
                 "Reply with the numbers you want to download.\n"
-                "Examples: `1,3,5` or `1-3` or `all`.",
+                "Examples: `1,3` or `1-3` or `all`.",
                 parse_mode="Markdown",
             )
             return
 
-        # sub_action == "all"
+        # sub_action == "all" — download all photos
         await callback.message.edit_text("Downloading all photos… ⏳")
-        files = await download_media(url, "gallery")
+
+        if photo_urls:
+            files = await download_tiktok_photos(photo_urls)
+        else:
+            files = await download_media(url, "gallery")
+
+        # Clean up
+        if cache_id and cache_id in gallery_cache:
+            del gallery_cache[cache_id]
+        await state.clear()
+
         if not files:
-            await callback.message.edit_text("Failed to download gallery.")
+            await callback.message.edit_text("Failed to download photos.")
             return
         try:
             media_group = []
@@ -331,7 +397,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         await state.set_state(BotStates.waiting_for_gif_timestamps)
         await callback.message.edit_text(
             "Reply with the time range for the GIF.\n"
-            "Format: `START-END` (e.g. `00:15-00:25` or `15-25`).\n"
+            "Format: `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
             "Keep it under 10 seconds for best results.",
             parse_mode="Markdown",
         )
@@ -353,7 +419,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.message.answer_audio(FSInputFile(filepath))
         await callback.message.edit_text("Done! ✅")
-    except Exception as e:
+    except Exception:
         await callback.message.edit_text("Failed to send file. It might be over Telegram's 50MB limit.")
     finally:
         if os.path.exists(filepath):
@@ -368,7 +434,7 @@ async def _convert_uploaded_video(
     message: Message, file_id: str, start_time: str, end_time: str
 ):
     """Downloads an uploaded video by file_id, converts a segment to GIF, sends it back."""
-    status_msg = await message.answer("Downloading your video… ⏳") if message.text else message
+    status_msg = await message.answer("Downloading your video… ⏳")
 
     try:
         file = await message.bot.get_file(file_id)
@@ -392,7 +458,7 @@ async def _convert_uploaded_video(
     try:
         await message.answer_animation(FSInputFile(gif_path))
         await status_msg.edit_text("Done! ✅")
-    except Exception as e:
+    except Exception:
         await status_msg.edit_text("Failed to send GIF. It might be too large.")
     finally:
         if os.path.exists(gif_path):
