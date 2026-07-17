@@ -8,16 +8,21 @@ router = Router()
 async def cmd_start(message: Message):
     text = (
         "👋 Welcome to the Media Downloader Bot!\n\n"
-        "Just send me a link from YouTube, TikTok, Instagram, or Twitter (X).\n"
-        "I will reply with options to download the video, extract the audio, or convert a segment to a GIF."
+        "Here is what I can do:\n"
+        "🔗 **Download from Links**: Just send me a link from YouTube, TikTok, Instagram, or Twitter (X).\n"
+        "   - I can download Videos, Audio, or convert them to GIFs!\n"
+        "   - I also support downloading TikTok/Instagram Photo Galleries.\n"
+        "🎞 **Convert Video to GIF**: Send me any video file directly and I can convert it to a GIF for you.\n\n"
+        "Send a link or drop a video to get started!"
     )
-    await message.answer(text)
+    await message.answer(text, parse_mode="Markdown")
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     text = (
         "Send me a link to a video or post.\n"
         "Supported sites: YouTube, TikTok, Instagram, Twitter.\n"
-        "You can choose to download video, audio, or convert it to a GIF."
+        "You can choose to download video, audio, or convert it to a GIF.\n\n"
+        "You can also upload a video directly to convert it to a GIF!"
     )
     await message.answer(text)
