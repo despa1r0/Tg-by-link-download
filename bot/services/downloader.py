@@ -4,10 +4,13 @@ import re
 import json
 import uuid
 import glob
+import logging
 import urllib.request
 import urllib.parse
 import yt_dlp
 from bot.config import DOWNLOADS_DIR
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────
 # Generic URL Resolution
@@ -145,6 +148,145 @@ def _find_image_post(obj, depth=0) -> list[str] | None:
 
 
 # ──────────────────────────────────────────────────────────
+# Twitter / X extraction (via fxtwitter API)
+# ──────────────────────────────────────────────────────────
+
+def _is_twitter_url(url: str) -> bool:
+    """Check if URL is a Twitter/X link."""
+    return any(d in url for d in (
+        'twitter.com', 'x.com',
+        'fxtwitter.com', 'vxtwitter.com', 'fixupx.com',
+    ))
+
+
+def _extract_twitter_media(url: str) -> dict | None:
+    """
+    Uses the fxtwitter.com API to extract media info from a tweet.
+    Returns a dict describing the tweet media:
+      - type: 'gif' | 'photo' | 'photos' | 'video'
+      - urls: list of direct media URLs
+      - title: tweet text snippet
+    Returns None on failure.
+    """
+    resolved = _resolve_url(url)
+
+    # Build the API URL: replace the domain with api.fxtwitter.com
+    api_url = re.sub(
+        r'https?://(www\.)?(twitter\.com|x\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com)',
+        'https://api.fxtwitter.com',
+        resolved,
+    )
+    # Strip query params (tracking junk)
+    api_url = api_url.split('?')[0]
+
+    req = urllib.request.Request(api_url, headers={
+        'User-Agent': 'TelegramBot/1.0',
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode('utf-8', errors='replace'))
+    except Exception as e:
+        logger.error("fxtwitter API error: %s", e)
+        return None
+
+    tweet = data.get('tweet')
+    if not tweet:
+        return None
+
+    title = (tweet.get('text') or 'Twitter Media')[:120]
+    media = tweet.get('media')
+    if not media:
+        return None
+
+    # fxtwitter returns media.all as a list of media objects
+    all_media = media.get('all') or []
+    if not all_media:
+        # Try legacy keys
+        photos_list = media.get('photos') or []
+        videos_list = media.get('videos') or []
+        all_media = photos_list + videos_list
+
+    if not all_media:
+        return None
+
+    # Classify by media type
+    # fxtwitter media types: 'photo', 'gif', 'video'
+    types_found = [m.get('type', '') for m in all_media]
+
+    if 'gif' in types_found:
+        # GIF tweet — the "gif" is actually an mp4 video
+        gif_item = next(m for m in all_media if m.get('type') == 'gif')
+        gif_url = gif_item.get('url') or ''
+        return {
+            'type': 'gif',
+            'urls': [gif_url],
+            'title': title,
+        }
+
+    photo_items = [m for m in all_media if m.get('type') == 'photo']
+    video_items = [m for m in all_media if m.get('type') == 'video']
+
+    if photo_items and not video_items:
+        photo_urls = [m.get('url', '') for m in photo_items if m.get('url')]
+        if len(photo_urls) == 1:
+            return {
+                'type': 'photo',
+                'urls': photo_urls,
+                'title': title,
+            }
+        else:
+            return {
+                'type': 'photos',
+                'urls': photo_urls,
+                'title': title,
+            }
+
+    if video_items:
+        # Pick the best quality video URL
+        vid = video_items[0]
+        vid_url = vid.get('url', '')
+        duration = vid.get('duration', 0)
+        return {
+            'type': 'video',
+            'urls': [vid_url],
+            'title': title,
+            'duration': duration,
+        }
+
+    return None
+
+
+async def download_twitter_media(
+    urls: list[str], indices: list[int] | None = None
+) -> list[str]:
+    """
+    Downloads Twitter media (photos or GIF mp4) by their direct URLs.
+    indices: 1-based list of which items to download. None = all.
+    Returns list of local file paths.
+    """
+    if indices is not None:
+        selected = [u for i, u in enumerate(urls, 1) if i in indices]
+    else:
+        selected = urls
+
+    loop = asyncio.get_running_loop()
+    paths = []
+    for media_url in selected:
+        unique_id = str(uuid.uuid4())
+        # Determine extension from URL
+        parsed_path = urllib.parse.urlparse(media_url).path
+        ext = parsed_path.rsplit('.', 1)[-1] if '.' in parsed_path else 'jpg'
+        # Normalise extension
+        if ext not in ('jpg', 'jpeg', 'png', 'webp', 'mp4', 'gif'):
+            ext = 'jpg'
+        dest = os.path.join(DOWNLOADS_DIR, f"{unique_id}.{ext}")
+        ok = await loop.run_in_executor(None, _download_image, media_url, dest)
+        if ok:
+            paths.append(dest)
+    return paths
+
+
+# ──────────────────────────────────────────────────────────
 # Reddit extraction (vxreddit proxy to bypass Cloudflare Turnstile)
 # ──────────────────────────────────────────────────────────
 
@@ -239,6 +381,7 @@ async def extract_info(url: str) -> dict | None:
     Extracts metadata about a URL.
     For TikTok photo posts: returns a dict with '_tiktok_photos' key.
     For Reddit posts: returns a dict with '_reddit_media' key.
+    For Twitter/X posts: returns a dict with '_twitter_media' key.
     For everything else: delegates to yt-dlp.
     """
     loop = asyncio.get_running_loop()
@@ -250,6 +393,16 @@ async def extract_info(url: str) -> dict | None:
             return {
                 '_tiktok_photos': photo_urls,
                 'extractor_key': 'TikTok',
+            }
+
+    # Check Twitter/X media via fxtwitter API
+    if _is_twitter_url(url):
+        twitter_media = await loop.run_in_executor(None, _extract_twitter_media, url)
+        if twitter_media:
+            return {
+                '_twitter_media': twitter_media,
+                'extractor_key': 'Twitter',
+                'title': twitter_media.get('title'),
             }
 
     # Check Reddit media (bypass Cloudflare block via vxreddit)
