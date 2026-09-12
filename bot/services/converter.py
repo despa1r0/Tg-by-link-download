@@ -10,8 +10,10 @@ logger = logging.getLogger(__name__)
 
 async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str | None:
     """
-    Converts a segment of a video to a high-quality GIF.
-    Uses custom palette generation (palettegen/paletteuse) to preserve color quality.
+    Converts a segment to a Telegram-native silent MP4 animation.
+
+    Telegram converts uploaded GIF files to this representation itself. Producing
+    it directly avoids broken/black previews and dramatically reduces file size.
     start_time and end_time can be plain seconds ('1', '6') or 'MM:SS' / 'HH:MM:SS'.
     Returns the output path on success, or None on failure.
     """
@@ -26,30 +28,39 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
         logger.warning("Invalid GIF timestamps: %s", exc)
         return None
     duration = end_seconds - start_seconds
-    if start_seconds < 0 or duration <= 0 or duration > 10:
-        logger.warning("GIF segment must be between 1 and 10 seconds")
+    if start_seconds < 0 or duration <= 0:
+        logger.warning("GIF segment duration must be positive")
         return None
 
     unique_id = str(uuid.uuid4())
-    output_path = os.path.join(DOWNLOADS_DIR, f"{unique_id}.gif")
+    output_path = os.path.join(DOWNLOADS_DIR, f"{unique_id}.mp4")
 
     def _convert():
         try:
             input_video = (
                 ffmpeg
                 .input(input_path, ss=start_seconds, t=duration)
-                .filter('fps', fps=12)
-                # Keep portrait/landscape proportions, avoid upscaling, and use an
-                # even height so Telegram's transcoder does not distort the result.
-                .filter('scale', 'min(480,iw)', -2)
+                .filter('fps', fps=15)
+                # Fit the longest side into 720 px without upscaling. Both output
+                # dimensions remain even, as required by H.264/yuv420p.
+                .filter(
+                    'scale',
+                    'if(gt(iw,ih),min(720,iw),-2)',
+                    'if(gt(iw,ih),-2,min(720,ih))',
+                )
                 .filter('setsar', 1)
             )
-            split = input_video.filter_multi_output('split')
-            palette = split[0].filter('palettegen', stats_mode='diff')
             (
-                ffmpeg
-                .filter([split[1], palette], 'paletteuse', dither='sierra2_4a')
-                .output(output_path, loop=0)
+                input_video
+                .output(
+                    output_path,
+                    vcodec='libx264',
+                    pix_fmt='yuv420p',
+                    preset='medium',
+                    crf=26,
+                    movflags='+faststart',
+                    an=None,
+                )
                 .overwrite_output()
                 .run(quiet=True)
             )

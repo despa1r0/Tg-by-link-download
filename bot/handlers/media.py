@@ -98,8 +98,10 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
         await message.answer("End time must be after start time. Try again.")
         return
     if end_sec - start_sec > 10:
-        await message.answer("A GIF segment can be at most 10 seconds long. Try again.")
-        return
+        await message.answer(
+            "⚠️ A longer animation may take more time, lose some quality, or exceed "
+            "Telegram's file-size limit. I will still convert the full range."
+        )
 
     # Read data BEFORE clearing state
     data = await state.get_data()
@@ -164,8 +166,10 @@ async def process_video_timestamps(message: Message, state: FSMContext):
         await message.answer("End time must be after start time. Try again.")
         return
     if end_sec - start_sec > 10:
-        await message.answer("A GIF segment can be at most 10 seconds long. Try again.")
-        return
+        await message.answer(
+            "⚠️ A longer animation may take more time, lose some quality, or exceed "
+            "Telegram's file-size limit. I will still convert the full range."
+        )
 
     data = await state.get_data()
     file_id = data.get("file_id")
@@ -584,7 +588,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             f"{duration_text}"
             "Reply with the time range for the GIF.\n"
             "Format: `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
-            "Keep it under 10 seconds for best results.",
+            "Longer ranges are allowed, but may produce larger files and lower quality.",
             parse_mode="Markdown",
         )
         return

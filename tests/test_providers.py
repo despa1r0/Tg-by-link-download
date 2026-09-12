@@ -38,6 +38,18 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://vxreddit.com/r/test/comments/abc/post")
         self.assertEqual(media["type"], "video")
 
+    @patch("bot.services.providers.instagram.urllib.request.urlopen")
+    def test_instagram_proxy_resolves_direct_video(self, urlopen):
+        urlopen.return_value = FakeResponse(
+            "",
+            url="https://scontent.example-cdn.test/media/reel.mp4?token=abc",
+        )
+        media = instagram.extract_proxy_media("https://www.instagram.com/reel/abc/")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.host, "kkinstagram.com")
+        self.assertEqual(media["type"], "video")
+        self.assertIn("reel.mp4", media["url"])
+
     @patch("bot.services.providers.twitter.urllib.request.urlopen")
     def test_twitter_animated_gif_is_classified_as_gif(self, urlopen):
         payload = {

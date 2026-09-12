@@ -4,7 +4,7 @@ import re
 import urllib.parse
 import urllib.request
 
-from bot.services.providers.common import USER_AGENT, hostname_matches, resolve_url
+from bot.services.providers.common import hostname_matches, resolve_url
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,12 @@ def extract_proxy_media(url: str) -> dict | None:
     proxy_url = urllib.parse.urlunsplit(
         ("https", "vxreddit.com", parsed.path, parsed.query, "")
     )
-    request = urllib.request.Request(proxy_url, headers={"User-Agent": USER_AGENT})
+    # Embed services expose media metadata to crawler user agents and redirect
+    # ordinary browsers back to Reddit.
+    request = urllib.request.Request(
+        proxy_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0)"},
+    )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             page = response.read().decode("utf-8", errors="replace")

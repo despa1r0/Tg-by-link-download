@@ -5,7 +5,7 @@ import os
 import uuid
 
 from bot.config import DOWNLOADS_DIR
-from bot.services.providers import reddit, tiktok, twitter, ytdlp
+from bot.services.providers import instagram, reddit, tiktok, twitter, ytdlp
 from bot.services.providers.common import download_file
 
 
@@ -28,12 +28,16 @@ async def extract_info(url: str) -> dict | None:
                 "title": media.get("title"),
             }
 
-    # Prefer yt-dlp for Reddit: its native extractor preserves separate audio tracks.
-    info = await ytdlp.extract_info(url)
-    if info:
-        return _tiktok_thumbnail_fallback(url, info)
+    # Prefer embed proxies for sites that frequently block anonymous VPS traffic.
+    if instagram.is_instagram_url(url):
+        media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
+        if media:
+            return {
+                "_instagram_media": media,
+                "extractor_key": "Instagram",
+                "title": media.get("title"),
+            }
 
-    # Some Reddit pages block direct extraction, so retain a corrected proxy fallback.
     if reddit.is_reddit_url(url):
         media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
         if media:
@@ -42,7 +46,9 @@ async def extract_info(url: str) -> dict | None:
                 "extractor_key": "Reddit",
                 "title": media.get("title"),
             }
-    return None
+
+    info = await ytdlp.extract_info(url)
+    return _tiktok_thumbnail_fallback(url, info) if info else None
 
 
 def _tiktok_thumbnail_fallback(url: str, info: dict) -> dict:
@@ -104,12 +110,21 @@ async def download_media(
     url: str, media_type: str, playlist_items: str | None = None
 ) -> list[str]:
     """Download video, audio, or gallery media from a supported URL."""
-    download_url = tiktok.normalize_url(url) if tiktok.is_tiktok_url(url) else url
-    files = await ytdlp.download(download_url, media_type, playlist_items)
-    if files or not reddit.is_reddit_url(url):
-        return files
+    loop = asyncio.get_running_loop()
 
-    media = await asyncio.get_running_loop().run_in_executor(None, reddit.extract_proxy_media, url)
-    if not media:
-        return []
-    return await ytdlp.download(media["url"], media_type, playlist_items)
+    if instagram.is_instagram_url(url):
+        media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
+        if media:
+            files = await ytdlp.download(media["url"], media_type, playlist_items)
+            if files:
+                return files
+
+    if reddit.is_reddit_url(url):
+        media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
+        if media:
+            files = await ytdlp.download(media["url"], media_type, playlist_items)
+            if files:
+                return files
+
+    download_url = tiktok.normalize_url(url) if tiktok.is_tiktok_url(url) else url
+    return await ytdlp.download(download_url, media_type, playlist_items)
