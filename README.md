@@ -1,6 +1,9 @@
 # Telegram Media Downloader Bot
 
-A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok, Instagram, and Twitter using `yt-dlp`. It can also convert specific video segments to GIFs.
+A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok, Instagram, Twitter, and Reddit using `yt-dlp`. It can also convert specific video segments to GIFs.
+
+> Telegram stores animations as silent H.264/MPEG-4 videos. Consequently, saving a
+> GIF sent as an animation from a Telegram client normally produces an `.mp4` file.
 
 ## Deployment (Docker)
 
@@ -15,6 +18,10 @@ A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok,
    cp .env.example .env
    # Open .env and add your Telegram BOT_TOKEN
    ```
+
+   Instagram may require authenticated cookies for restricted posts or when its
+   anonymous API is rate-limited. Export a Netscape-format cookies file, mount it
+   read-only into the container, and set `YTDLP_COOKIES_FILE` to its container path.
 
 3. Build and start the bot in the background:
    ```bash

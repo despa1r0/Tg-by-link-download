@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import urllib.parse
 from aiogram import Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -16,6 +17,7 @@ from bot.services.downloader import (
 )
 from bot.services.converter import convert_to_gif
 from bot.config import DOWNLOADS_DIR
+from bot.services.providers.instagram import is_instagram_url
 
 logger = logging.getLogger(__name__)
 
@@ -28,28 +30,41 @@ class BotStates(StatesGroup):
     waiting_for_gallery_selection = State()      # user picks which photos to download
 
 
-url_cache: dict[int, str] = {}
+CacheKey = tuple[int, int]
+url_cache: dict[CacheKey, str] = {}
 # Stores photo URLs when a gallery is detected (TikTok or Twitter)
-gallery_cache: dict[int, list[str]] = {}
+gallery_cache: dict[CacheKey, list[str]] = {}
 # Stores the source platform for gallery downloads ('tiktok' or 'twitter')
-gallery_source_cache: dict[int, str] = {}
+gallery_source_cache: dict[CacheKey, str] = {}
 
 
 def is_valid_url(text: str) -> bool:
-    return text.startswith("http://") or text.startswith("https://")
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    except ValueError:
+        return False
 
 
 def parse_time_to_seconds(t: str) -> int:
     """Convert a timestamp like '1', '01:30', '1:05:30' to total seconds."""
     parts = t.split(':')
+    if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
+        raise ValueError("invalid timestamp")
     parts = [int(p) for p in parts]
+    if len(parts) > 1 and any(part >= 60 for part in parts[1:]):
+        raise ValueError("timestamp component is out of range")
     if len(parts) == 1:
         return parts[0]
     elif len(parts) == 2:
         return parts[0] * 60 + parts[1]
     elif len(parts) == 3:
         return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    return 0
+    raise ValueError("invalid timestamp")
+
+
+def _cache_key(message: Message) -> CacheKey:
+    return message.chat.id, message.message_id
 
 
 # ──────────────────────────────────────────────────────────
@@ -62,7 +77,7 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
     """User replied with timestamps for a URL → GIF conversion."""
     text = (message.text or "").strip()
 
-    match = re.match(r"^([\d:]+)\s*-\s*([\d:]+)$", text)
+    match = re.fullmatch(r"(\d+(?::\d+){0,2})\s*-\s*(\d+(?::\d+){0,2})", text)
     if not match:
         await message.answer(
             "Invalid format. Please use `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
@@ -73,10 +88,17 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
     start_time, end_time = match.groups()
 
     # Validate that end > start
-    start_sec = parse_time_to_seconds(start_time)
-    end_sec = parse_time_to_seconds(end_time)
+    try:
+        start_sec = parse_time_to_seconds(start_time)
+        end_sec = parse_time_to_seconds(end_time)
+    except ValueError:
+        await message.answer("Invalid timestamp. Use seconds, MM:SS, or HH:MM:SS.")
+        return
     if end_sec <= start_sec:
         await message.answer("End time must be after start time. Try again.")
+        return
+    if end_sec - start_sec > 10:
+        await message.answer("A GIF segment can be at most 10 seconds long. Try again.")
         return
 
     # Read data BEFORE clearing state
@@ -122,7 +144,7 @@ async def process_video_timestamps(message: Message, state: FSMContext):
     """User replied with timestamps for an uploaded video → GIF conversion."""
     text = (message.text or "").strip()
 
-    match = re.match(r"^([\d:]+)\s*-\s*([\d:]+)$", text)
+    match = re.fullmatch(r"(\d+(?::\d+){0,2})\s*-\s*(\d+(?::\d+){0,2})", text)
     if not match:
         await message.answer(
             "Invalid format. Please use `START-END` (e.g. `00:15-00:25` or `1-6`).\n"
@@ -132,10 +154,17 @@ async def process_video_timestamps(message: Message, state: FSMContext):
 
     start_time, end_time = match.groups()
 
-    start_sec = parse_time_to_seconds(start_time)
-    end_sec = parse_time_to_seconds(end_time)
+    try:
+        start_sec = parse_time_to_seconds(start_time)
+        end_sec = parse_time_to_seconds(end_time)
+    except ValueError:
+        await message.answer("Invalid timestamp. Use seconds, MM:SS, or HH:MM:SS.")
+        return
     if end_sec <= start_sec:
         await message.answer("End time must be after start time. Try again.")
+        return
+    if end_sec - start_sec > 10:
+        await message.answer("A GIF segment can be at most 10 seconds long. Try again.")
         return
 
     data = await state.get_data()
@@ -152,7 +181,7 @@ async def process_gallery_selection(message: Message, state: FSMContext):
     data = await state.get_data()
     url = data.get("url")
     total = data.get("gallery_count", 0)
-    cache_id = data.get("gallery_cache_id")
+    cache_id = tuple(data.get("gallery_cache_id", ()))
     photo_urls = gallery_cache.get(cache_id, []) if cache_id else []
     await state.clear()
 
@@ -242,9 +271,22 @@ async def handle_link(message: Message, state: FSMContext):
         await message.answer("Please send a valid HTTP/HTTPS URL.")
         return
 
+    # A state-less FSM context may still contain data from the previous link.
+    await state.clear()
     msg = await message.reply("Analyzing link… ⏳")
 
     info = await extract_info(text)
+
+    if not info:
+        if is_instagram_url(text):
+            await msg.edit_text(
+                "Instagram did not provide access to this post. Public posts can be "
+                "downloaded directly; restricted or rate-limited posts require a "
+                "YTDLP_COOKIES_FILE in the bot configuration."
+            )
+        else:
+            await msg.edit_text("Could not analyze this link. It may be private or unsupported.")
+        return
 
     # ── Twitter/X media (GIF, photo, photos, video) ──
     twitter_media = info.get('_twitter_media') if info else None
@@ -294,7 +336,7 @@ async def handle_link(message: Message, state: FSMContext):
         # Multiple photos — gallery selection flow
         if tw_type == 'photos' and tw_urls:
             count = len(tw_urls)
-            cache_id = msg.message_id
+            cache_id = _cache_key(msg)
             gallery_cache[cache_id] = tw_urls
             gallery_source_cache[cache_id] = 'twitter'
 
@@ -308,8 +350,8 @@ async def handle_link(message: Message, state: FSMContext):
                 reply_markup=keyboard,
                 parse_mode="Markdown",
             )
-            url_cache[msg.message_id] = text
-            await state.update_data(gallery_count=count, gallery_cache_id=cache_id)
+            url_cache[_cache_key(msg)] = text
+            await state.update_data(gallery_count=count, gallery_cache_id=list(cache_id))
             return
 
         # Twitter video — show normal video menu
@@ -322,7 +364,7 @@ async def handle_link(message: Message, state: FSMContext):
                 [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
             ])
             await msg.edit_text("🐦 Twitter video detected! Choose an action:", reply_markup=keyboard)
-            url_cache[msg.message_id] = text
+            url_cache[_cache_key(msg)] = text
             if duration:
                 await state.update_data(video_duration=duration)
             return
@@ -334,7 +376,7 @@ async def handle_link(message: Message, state: FSMContext):
         cache_id = None
         tiktok_photos = info.get('_tiktok_photos')
         if tiktok_photos:
-            cache_id = msg.message_id
+            cache_id = _cache_key(msg)
             gallery_cache[cache_id] = tiktok_photos
             gallery_source_cache[cache_id] = 'tiktok'
 
@@ -348,8 +390,11 @@ async def handle_link(message: Message, state: FSMContext):
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
-        url_cache[msg.message_id] = text
-        await state.update_data(gallery_count=count, gallery_cache_id=cache_id)
+        url_cache[_cache_key(msg)] = text
+        await state.update_data(
+            gallery_count=count,
+            gallery_cache_id=list(cache_id) if cache_id else [],
+        )
         return
 
     # Store video duration for later (GIF auto-convert for short videos)
@@ -362,7 +407,7 @@ async def handle_link(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
     ])
     await msg.edit_text("Link detected! Choose an action:", reply_markup=keyboard)
-    url_cache[msg.message_id] = text
+    url_cache[_cache_key(msg)] = text
     if duration:
         await state.update_data(video_duration=duration)
 
@@ -375,7 +420,7 @@ async def handle_video_upload(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
     ])
     msg = await message.reply("Video received! What would you like to do?", reply_markup=keyboard)
-    url_cache[msg.message_id] = message.video.file_id
+    url_cache[_cache_key(msg)] = message.video.file_id
 
 
 # ──────────────────────────────────────────────────────────
@@ -385,17 +430,19 @@ async def handle_video_upload(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("conv_"))
 async def handle_video_convert_callback(callback: CallbackQuery, state: FSMContext):
     """Callback for converting an uploaded video."""
-    message_id = callback.message.message_id
-    file_id = url_cache.get(message_id)
+    cache_key = _cache_key(callback.message)
+    file_id = url_cache.get(cache_key)
 
     if not file_id:
         await callback.answer("File expired. Please send the video again.", show_alert=True)
         return
+    await callback.answer()
 
     video = callback.message.reply_to_message.video
     if video and video.duration and video.duration > 10:
         await state.update_data(file_id=file_id)
         await state.set_state(BotStates.waiting_for_video_timestamps)
+        url_cache.pop(cache_key, None)
         await callback.message.edit_text(
             f"The video is **{video.duration}s** long.\n"
             "Please reply with the time range for the GIF.\n"
@@ -407,6 +454,7 @@ async def handle_video_convert_callback(callback: CallbackQuery, state: FSMConte
         await callback.message.edit_text("Converting entire video to GIF… ⏳")
         duration = str(video.duration) if video and video.duration else "10"
         await _convert_uploaded_video(callback.message, file_id, "0", duration)
+        url_cache.pop(cache_key, None)
 
 
 @router.callback_query(F.data.startswith("dl_"))
@@ -415,27 +463,29 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     raw = callback.data
     parts = raw.split("_")
     action = parts[1]
-    message_id = callback.message.message_id
-    url = url_cache.get(message_id)
+    cache_key = _cache_key(callback.message)
+    url = url_cache.get(cache_key)
 
     # ── Cancel ──
     if action == "cancel":
+        await callback.answer()
         await callback.message.edit_text("Action cancelled.")
-        url_cache.pop(message_id, None)
-        gallery_cache.pop(message_id, None)
-        gallery_source_cache.pop(message_id, None)
+        url_cache.pop(cache_key, None)
+        gallery_cache.pop(cache_key, None)
+        gallery_source_cache.pop(cache_key, None)
         await state.clear()
         return
 
     if not url:
         await callback.answer("Link expired. Please send it again.", show_alert=True)
         return
+    await callback.answer()
 
     # ── Gallery ──
     if action == "gallery":
         sub_action = parts[2] if len(parts) > 2 else "all"
         data = await state.get_data()
-        cache_id = data.get("gallery_cache_id")
+        cache_id = tuple(data.get("gallery_cache_id", ()))
         photo_urls = gallery_cache.get(cache_id, []) if cache_id else []
 
         if sub_action == "pick":
@@ -467,6 +517,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         if cache_id and cache_id in gallery_source_cache:
             del gallery_source_cache[cache_id]
         await state.clear()
+        url_cache.pop(cache_key, None)
 
         if not files:
             await callback.message.edit_text("Failed to download photos.")
@@ -520,11 +571,14 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             finally:
                 if os.path.exists(gif_path):
                     os.remove(gif_path)
+                url_cache.pop(cache_key, None)
+                await state.clear()
             return
 
         # Longer video — ask for timestamps
         await state.update_data(url=url)
         await state.set_state(BotStates.waiting_for_gif_timestamps)
+        url_cache.pop(cache_key, None)
         duration_text = f"The video is **{duration}s** long.\n" if duration else ""
         await callback.message.edit_text(
             f"{duration_text}"
@@ -561,6 +615,8 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
+        url_cache.pop(cache_key, None)
+        await state.clear()
 
 
 # ──────────────────────────────────────────────────────────

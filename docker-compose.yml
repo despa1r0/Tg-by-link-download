@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   bot:
     build: .
@@ -9,3 +7,5 @@ services:
       - .env
     volumes:
       - ./downloads:/app/downloads
+      # Uncomment when YTDLP_COOKIES_FILE=/app/secrets/cookies.txt is configured.
+      # - ./cookies.txt:/app/secrets/cookies.txt:ro
