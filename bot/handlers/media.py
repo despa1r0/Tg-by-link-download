@@ -13,7 +13,7 @@ from aiogram.filters import StateFilter
 
 from bot.services.downloader import (
     download_media, extract_info, is_gallery, get_gallery_count,
-    download_tiktok_photos, download_twitter_media,
+    download_detected_photo, download_tiktok_photos, download_twitter_media,
 )
 from bot.services.converter import convert_to_gif
 from bot.config import DOWNLOADS_DIR
@@ -36,6 +36,8 @@ url_cache: dict[CacheKey, str] = {}
 gallery_cache: dict[CacheKey, list[str]] = {}
 # Stores the source platform for gallery downloads ('tiktok' or 'twitter')
 gallery_source_cache: dict[CacheKey, str] = {}
+# Stores the resolved CDN URL so a photo click does not call the proxy twice.
+photo_url_cache: dict[CacheKey, str] = {}
 
 
 def is_valid_url(text: str) -> bool:
@@ -373,6 +375,23 @@ async def handle_link(message: Message, state: FSMContext):
                 await state.update_data(video_duration=duration)
             return
 
+    # ── Instagram/Reddit photo ──
+    detected_media = info.get('_instagram_media') or info.get('_reddit_media')
+    if detected_media and detected_media.get('type') in {'photo', 'image'}:
+        platform = info.get('extractor_key', 'Social media')
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📷 Download Photo", callback_data="dl_photo")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
+        ])
+        await msg.edit_text(
+            f"📷 {platform} photo detected! Choose an action:",
+            reply_markup=keyboard,
+        )
+        cache_id = _cache_key(msg)
+        url_cache[cache_id] = text
+        photo_url_cache[cache_id] = detected_media['url']
+        return
+
     if info and is_gallery(info):
         count = get_gallery_count(info)
 
@@ -477,6 +496,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         url_cache.pop(cache_key, None)
         gallery_cache.pop(cache_key, None)
         gallery_source_cache.pop(cache_key, None)
+        photo_url_cache.pop(cache_key, None)
         await state.clear()
         return
 
@@ -591,6 +611,33 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             "Longer ranges are allowed, but may produce larger files and lower quality.",
             parse_mode="Markdown",
         )
+        return
+
+    # ── Download photo ──
+    if action == "photo":
+        await callback.message.edit_text("Downloading photo… ⏳")
+        files = await download_detected_photo(photo_url_cache.get(cache_key, ""))
+        filepath = files[0] if files else None
+
+        if not filepath:
+            await callback.message.edit_text("Failed to download photo.")
+            url_cache.pop(cache_key, None)
+            photo_url_cache.pop(cache_key, None)
+            await state.clear()
+            return
+
+        try:
+            await callback.message.answer_photo(FSInputFile(filepath))
+            await callback.message.edit_text("Done! ✅")
+        except Exception as exc:
+            logger.error("Failed to send detected photo: %s", exc)
+            await callback.message.edit_text("Failed to send photo.")
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            url_cache.pop(cache_key, None)
+            photo_url_cache.pop(cache_key, None)
+            await state.clear()
         return
 
     # ── Download video / audio ──

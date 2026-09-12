@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import urllib.parse
 import uuid
 
 from bot.config import DOWNLOADS_DIR
@@ -106,6 +107,19 @@ async def _download_direct_files(urls: list[str], extension: str) -> list[str]:
     return paths
 
 
+async def download_detected_photo(media_url: str) -> list[str]:
+    """Download a previously detected Instagram or Reddit photo URL."""
+    if not media_url:
+        return []
+
+    path = urllib.parse.urlsplit(media_url).path
+    extension = path.rsplit(".", 1)[-1].lower() if "." in path else "jpg"
+    if extension not in {"jpg", "jpeg", "png", "webp"}:
+        extension = "jpg"
+
+    return await _download_direct_files([media_url], extension)
+
+
 async def download_media(
     url: str, media_type: str, playlist_items: str | None = None
 ) -> list[str]:
@@ -115,6 +129,8 @@ async def download_media(
     if instagram.is_instagram_url(url):
         media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
         if media:
+            if media.get("type") in {"photo", "image"}:
+                return await _download_direct_files([media["url"]], "jpg")
             files = await ytdlp.download(media["url"], media_type, playlist_items)
             if files:
                 return files
@@ -122,6 +138,8 @@ async def download_media(
     if reddit.is_reddit_url(url):
         media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
         if media:
+            if media.get("type") in {"photo", "image"}:
+                return await _download_direct_files([media["url"]], "jpg")
             files = await ytdlp.download(media["url"], media_type, playlist_items)
             if files:
                 return files

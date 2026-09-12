@@ -56,4 +56,4 @@ def extract_proxy_media(url: str) -> dict | None:
     nested_url = urllib.parse.parse_qs(urllib.parse.urlsplit(image_url).query).get("url")
     if nested_url:
         image_url = nested_url[0]
-    return {"type": "image", "url": image_url, "title": title}
+    return {"type": "photo", "url": image_url, "title": title}
