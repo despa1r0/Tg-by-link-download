@@ -1,11 +1,13 @@
 import asyncio
+import math
 import os
 import uuid
 import logging
 import ffmpeg
-from bot.config import DOWNLOADS_DIR
+from bot.config import DOWNLOADS_DIR, FFMPEG_CONCURRENCY
 
 logger = logging.getLogger(__name__)
+_FFMPEG_SEMAPHORE = asyncio.Semaphore(FFMPEG_CONCURRENCY)
 
 
 async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str | None:
@@ -56,7 +58,9 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
                     output_path,
                     vcodec='libx264',
                     pix_fmt='yuv420p',
-                    preset='medium',
+                    # `fast` noticeably reduces CPU time for interactive bot
+                    # jobs while CRF keeps the visual quality target stable.
+                    preset='fast',
                     crf=26,
                     movflags='+faststart',
                     an=None,
@@ -78,12 +82,25 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
             if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
                 os.remove(output_path)
 
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _convert)
-    return result
+    async with _FFMPEG_SEMAPHORE:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _convert)
 
 
-def _timestamp_to_seconds(value: str) -> int:
+def _timestamp_to_seconds(value: str) -> int | float:
+    # Metadata extractors commonly report duration with millisecond precision
+    # (for example, FxTwitter may return 7.533). User-entered timestamps are
+    # still validated by the handler, but the full-video conversion path must
+    # accept these provider-generated values.
+    if ':' not in value:
+        try:
+            seconds = float(value)
+        except ValueError as exc:
+            raise ValueError(f"invalid timestamp: {value}") from exc
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"invalid timestamp: {value}")
+        return int(seconds) if seconds.is_integer() else seconds
+
     parts = value.split(':')
     if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
         raise ValueError(f"invalid timestamp: {value}")

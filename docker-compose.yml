@@ -1,5 +1,6 @@
 services:
   bot:
+    image: ${BOT_IMAGE:-tg-media-bot:local}
     build: .
     container_name: tg_media_bot
     restart: unless-stopped

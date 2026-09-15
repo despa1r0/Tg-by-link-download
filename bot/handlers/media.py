@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import time
 import urllib.parse
 from aiogram import Router, F
 from aiogram.types import (
@@ -38,6 +39,55 @@ gallery_cache: dict[CacheKey, list[str]] = {}
 gallery_source_cache: dict[CacheKey, str] = {}
 # Stores the resolved CDN URL so a photo click does not call the proxy twice.
 photo_url_cache: dict[CacheKey, str] = {}
+# Keeps only compact provider results needed by the eventual download action.
+media_info_cache: dict[CacheKey, dict] = {}
+cache_expiry: dict[CacheKey, float] = {}
+CACHE_TTL_SECONDS = 15 * 60
+MAX_CACHE_ENTRIES = 1000
+
+
+def _drop_cache(cache_key: CacheKey) -> None:
+    url_cache.pop(cache_key, None)
+    gallery_cache.pop(cache_key, None)
+    gallery_source_cache.pop(cache_key, None)
+    photo_url_cache.pop(cache_key, None)
+    media_info_cache.pop(cache_key, None)
+    cache_expiry.pop(cache_key, None)
+
+
+def _purge_cache() -> None:
+    now = time.monotonic()
+    for cache_key, expires_at in list(cache_expiry.items()):
+        if expires_at <= now:
+            _drop_cache(cache_key)
+
+
+def _compact_media_info(info: dict | None) -> dict:
+    if not info:
+        return {}
+    reusable_keys = (
+        "_twitter_media",
+        "_instagram_media",
+        "_reddit_media",
+        "_download_url",
+    )
+    return {key: info[key] for key in reusable_keys if key in info}
+
+
+def _store_cache(cache_key: CacheKey, value: str, info: dict | None = None) -> None:
+    _purge_cache()
+    if cache_key not in url_cache and len(url_cache) >= MAX_CACHE_ENTRIES:
+        oldest_key = min(
+            url_cache,
+            key=lambda key: cache_expiry.get(key, float("-inf")),
+        )
+        _drop_cache(oldest_key)
+    url_cache[cache_key] = value
+    compact_info = _compact_media_info(info)
+    media_info_cache.pop(cache_key, None)
+    if compact_info:
+        media_info_cache[cache_key] = compact_info
+    cache_expiry[cache_key] = time.monotonic() + CACHE_TTL_SECONDS
 
 
 def is_valid_url(text: str) -> bool:
@@ -108,6 +158,7 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
     # Read data BEFORE clearing state
     data = await state.get_data()
     url = data.get("url")
+    media_info = data.get("media_info")
     await state.clear()
 
     if not url:
@@ -116,7 +167,7 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
 
     status_msg = await message.answer("Downloading video for GIF conversion… ⏳")
 
-    files = await download_media(url, "video")
+    files = await download_media(url, "video", media_info=media_info)
     filepath = files[0] if files else None
 
     if not filepath:
@@ -234,10 +285,8 @@ async def process_gallery_selection(message: Message, state: FSMContext):
         files = await download_media(url, "gallery", playlist_items=playlist_items)
 
     # Clean up gallery cache
-    if cache_id and cache_id in gallery_cache:
-        del gallery_cache[cache_id]
-    if cache_id and cache_id in gallery_source_cache:
-        del gallery_source_cache[cache_id]
+    if cache_id:
+        _drop_cache(cache_id)
 
     if not files:
         await status_msg.edit_text("Failed to download photos.")
@@ -356,7 +405,7 @@ async def handle_link(message: Message, state: FSMContext):
                 reply_markup=keyboard,
                 parse_mode="Markdown",
             )
-            url_cache[_cache_key(msg)] = text
+            _store_cache(cache_id, text)
             await state.update_data(gallery_count=count, gallery_cache_id=list(cache_id))
             return
 
@@ -370,7 +419,7 @@ async def handle_link(message: Message, state: FSMContext):
                 [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
             ])
             await msg.edit_text("🐦 Twitter video detected! Choose an action:", reply_markup=keyboard)
-            url_cache[_cache_key(msg)] = text
+            _store_cache(_cache_key(msg), text, info)
             if duration:
                 await state.update_data(video_duration=duration)
             return
@@ -388,7 +437,7 @@ async def handle_link(message: Message, state: FSMContext):
             reply_markup=keyboard,
         )
         cache_id = _cache_key(msg)
-        url_cache[cache_id] = text
+        _store_cache(cache_id, text)
         photo_url_cache[cache_id] = detected_media['url']
         return
 
@@ -396,10 +445,9 @@ async def handle_link(message: Message, state: FSMContext):
         count = get_gallery_count(info)
 
         # Cache photo URLs for later download (TikTok)
-        cache_id = None
+        cache_id = _cache_key(msg)
         tiktok_photos = info.get('_tiktok_photos')
         if tiktok_photos:
-            cache_id = _cache_key(msg)
             gallery_cache[cache_id] = tiktok_photos
             gallery_source_cache[cache_id] = 'tiktok'
 
@@ -413,10 +461,10 @@ async def handle_link(message: Message, state: FSMContext):
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
-        url_cache[_cache_key(msg)] = text
+        _store_cache(cache_id, text)
         await state.update_data(
             gallery_count=count,
-            gallery_cache_id=list(cache_id) if cache_id else [],
+            gallery_cache_id=list(cache_id),
         )
         return
 
@@ -430,7 +478,7 @@ async def handle_link(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
     ])
     await msg.edit_text("Link detected! Choose an action:", reply_markup=keyboard)
-    url_cache[_cache_key(msg)] = text
+    _store_cache(_cache_key(msg), text, info)
     if duration:
         await state.update_data(video_duration=duration)
 
@@ -443,7 +491,7 @@ async def handle_video_upload(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
     ])
     msg = await message.reply("Video received! What would you like to do?", reply_markup=keyboard)
-    url_cache[_cache_key(msg)] = message.video.file_id
+    _store_cache(_cache_key(msg), message.video.file_id)
 
 
 # ──────────────────────────────────────────────────────────
@@ -453,6 +501,7 @@ async def handle_video_upload(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("conv_"))
 async def handle_video_convert_callback(callback: CallbackQuery, state: FSMContext):
     """Callback for converting an uploaded video."""
+    _purge_cache()
     cache_key = _cache_key(callback.message)
     file_id = url_cache.get(cache_key)
 
@@ -465,7 +514,7 @@ async def handle_video_convert_callback(callback: CallbackQuery, state: FSMConte
     if video and video.duration and video.duration > 10:
         await state.update_data(file_id=file_id)
         await state.set_state(BotStates.waiting_for_video_timestamps)
-        url_cache.pop(cache_key, None)
+        _drop_cache(cache_key)
         await callback.message.edit_text(
             f"The video is **{video.duration}s** long.\n"
             "Please reply with the time range for the GIF.\n"
@@ -477,26 +526,25 @@ async def handle_video_convert_callback(callback: CallbackQuery, state: FSMConte
         await callback.message.edit_text("Converting entire video to GIF… ⏳")
         duration = str(video.duration) if video and video.duration else "10"
         await _convert_uploaded_video(callback.message, file_id, "0", duration)
-        url_cache.pop(cache_key, None)
+        _drop_cache(cache_key)
 
 
 @router.callback_query(F.data.startswith("dl_"))
 async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     """Callback for link-based actions (download video/audio/gif, gallery, cancel)."""
+    _purge_cache()
     raw = callback.data
     parts = raw.split("_")
     action = parts[1]
     cache_key = _cache_key(callback.message)
     url = url_cache.get(cache_key)
+    media_info = media_info_cache.get(cache_key)
 
     # ── Cancel ──
     if action == "cancel":
         await callback.answer()
         await callback.message.edit_text("Action cancelled.")
-        url_cache.pop(cache_key, None)
-        gallery_cache.pop(cache_key, None)
-        gallery_source_cache.pop(cache_key, None)
-        photo_url_cache.pop(cache_key, None)
+        _drop_cache(cache_key)
         await state.clear()
         return
 
@@ -533,15 +581,13 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         elif photo_urls:
             files = await download_tiktok_photos(photo_urls)
         else:
-            files = await download_media(url, "gallery")
+            files = await download_media(url, "gallery", media_info=media_info)
 
         # Clean up
-        if cache_id and cache_id in gallery_cache:
-            del gallery_cache[cache_id]
-        if cache_id and cache_id in gallery_source_cache:
-            del gallery_source_cache[cache_id]
         await state.clear()
-        url_cache.pop(cache_key, None)
+        if cache_id:
+            _drop_cache(cache_id)
+        _drop_cache(cache_key)
 
         if not files:
             await callback.message.edit_text("Failed to download photos.")
@@ -576,16 +622,20 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(
                 f"Video is only {duration}s — converting the full video to GIF… ⏳"
             )
-            files = await download_media(url, "video")
+            files = await download_media(url, "video", media_info=media_info)
             filepath = files[0] if files else None
             if not filepath:
                 await callback.message.edit_text("Failed to download video.")
+                _drop_cache(cache_key)
+                await state.clear()
                 return
             gif_path = await convert_to_gif(filepath, "0", str(duration))
             if os.path.exists(filepath):
                 os.remove(filepath)
             if not gif_path:
                 await callback.message.edit_text("Failed to convert video to GIF.")
+                _drop_cache(cache_key)
+                await state.clear()
                 return
             try:
                 await callback.message.answer_animation(FSInputFile(gif_path))
@@ -595,14 +645,14 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             finally:
                 if os.path.exists(gif_path):
                     os.remove(gif_path)
-                url_cache.pop(cache_key, None)
+                _drop_cache(cache_key)
                 await state.clear()
             return
 
         # Longer video — ask for timestamps
-        await state.update_data(url=url)
+        await state.update_data(url=url, media_info=media_info)
         await state.set_state(BotStates.waiting_for_gif_timestamps)
-        url_cache.pop(cache_key, None)
+        _drop_cache(cache_key)
         duration_text = f"The video is **{duration}s** long.\n" if duration else ""
         await callback.message.edit_text(
             f"{duration_text}"
@@ -621,8 +671,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
 
         if not filepath:
             await callback.message.edit_text("Failed to download photo.")
-            url_cache.pop(cache_key, None)
-            photo_url_cache.pop(cache_key, None)
+            _drop_cache(cache_key)
             await state.clear()
             return
 
@@ -635,19 +684,20 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         finally:
             if os.path.exists(filepath):
                 os.remove(filepath)
-            url_cache.pop(cache_key, None)
-            photo_url_cache.pop(cache_key, None)
+            _drop_cache(cache_key)
             await state.clear()
         return
 
     # ── Download video / audio ──
     await callback.message.edit_text("Processing your request… ⏳")
 
-    files = await download_media(url, action)
+    files = await download_media(url, action, media_info=media_info)
     filepath = files[0] if files else None
 
     if not filepath:
         await callback.message.edit_text("Failed to download. It might be unsupported or too large.")
+        _drop_cache(cache_key)
+        await state.clear()
         return
 
     try:
@@ -666,7 +716,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
-        url_cache.pop(cache_key, None)
+        _drop_cache(cache_key)
         await state.clear()
 
 
