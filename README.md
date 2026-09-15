@@ -25,7 +25,7 @@ A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok,
 
 3. Build and start the bot in the background:
    ```bash
-   docker-compose up -d --build
+   docker compose up -d --build
    ```
 
 That's it! The bot is now running.

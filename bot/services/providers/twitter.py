@@ -86,12 +86,18 @@ def _best_video_url(media: dict) -> str:
 async def download_media(urls: list[str], indices: list[int] | None = None) -> list[str]:
     selected = [url for index, url in enumerate(urls, 1) if indices is None or index in indices]
     loop = asyncio.get_running_loop()
-    paths = []
-    for media_url in selected:
+    semaphore = asyncio.Semaphore(4)
+
+    async def _download_one(media_url: str) -> str | None:
         extension = urllib.parse.urlsplit(media_url).path.rsplit(".", 1)[-1].lower()
         if extension not in {"jpg", "jpeg", "png", "webp", "mp4", "gif"}:
             extension = "jpg"
         destination = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.{extension}")
-        if await loop.run_in_executor(None, download_file, media_url, destination):
-            paths.append(destination)
-    return paths
+        async with semaphore:
+            downloaded = await loop.run_in_executor(
+                None, download_file, media_url, destination
+            )
+        return destination if downloaded else None
+
+    paths = await asyncio.gather(*(_download_one(url) for url in selected))
+    return [path for path in paths if path]

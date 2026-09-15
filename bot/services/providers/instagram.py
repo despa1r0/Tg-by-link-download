@@ -26,6 +26,7 @@ def extract_proxy_media(url: str) -> dict | None:
     if not is_instagram_url(url):
         return None
 
+    photo_fallback = None
     for proxy_domain in PROXY_DOMAINS:
         proxy_url = urllib.parse.urlunsplit(
             ("https", proxy_domain, parsed.path, parsed.query, "")
@@ -35,18 +36,36 @@ def extract_proxy_media(url: str) -> dict | None:
             with urllib.request.urlopen(request, timeout=20) as response:
                 final_url = response.url
                 if not hostname_matches(final_url, PROXY_DOMAINS):
-                    return {
-                        "type": _media_type(final_url),
-                        "url": final_url,
-                        "title": "Instagram Media",
-                    }
+                    media_type = _response_media_type(response, final_url)
+                    if media_type:
+                        result = {
+                            "type": media_type,
+                            "url": final_url,
+                            "title": "Instagram Media",
+                        }
+                        if media_type == "video":
+                            return result
+                        photo_fallback = photo_fallback or result
+                    # A proxy can redirect back to the Instagram post when its
+                    # scraper is rate-limited. That HTML page is not a photo.
+                    continue
                 page = response.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
         except Exception as exc:
             logger.warning("Instagram proxy %s failed: %s", proxy_domain, exc)
             continue
 
-        video_url = _meta_content(page, "og:video") or _meta_content(
-            page, "twitter:player:stream"
+        video_url = next(
+            (
+                value
+                for property_name in (
+                    "og:video",
+                    "og:video:url",
+                    "og:video:secure_url",
+                    "twitter:player:stream",
+                )
+                if (value := _meta_content(page, property_name))
+            ),
+            None,
         )
         if video_url:
             return {
@@ -58,20 +77,20 @@ def extract_proxy_media(url: str) -> dict | None:
             }
         image_url = _meta_content(page, "og:image")
         if image_url:
-            return {
+            photo_fallback = photo_fallback or {
                 "type": "photo",
                 "url": urllib.parse.urljoin(proxy_url, html_module.unescape(image_url)),
                 "title": html_module.unescape(
                     _meta_content(page, "og:title") or "Instagram Media"
                 ),
             }
-    return None
+    return photo_fallback
 
 
 def _meta_content(page: str, property_name: str) -> str | None:
     patterns = (
-        rf'<meta[^>]+(?:property|name)=["\']{re.escape(property_name)}["\'][^>]+content=["\']([^"\']+)',
-        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{re.escape(property_name)}["\']',
+        rf'<meta[^>]+(?:property|name)\s*=\s*["\']{re.escape(property_name)}["\'][^>]+content\s*=\s*["\']([^"\']+)',
+        rf'<meta[^>]+content\s*=\s*["\']([^"\']+)["\'][^>]+(?:property|name)\s*=\s*["\']{re.escape(property_name)}["\']',
     )
     for pattern in patterns:
         if match := re.search(pattern, page, re.IGNORECASE):
@@ -79,6 +98,19 @@ def _meta_content(page: str, property_name: str) -> str | None:
     return None
 
 
-def _media_type(url: str) -> str:
+def _response_media_type(response, url: str) -> str | None:
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("image/"):
+        return "photo"
+    return _media_type(url)
+
+
+def _media_type(url: str) -> str | None:
     path = urllib.parse.urlsplit(url).path.lower()
-    return "video" if path.endswith((".mp4", ".mov", ".webm")) else "photo"
+    if path.endswith((".mp4", ".mov", ".webm")):
+        return "video"
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return "photo"
+    return None

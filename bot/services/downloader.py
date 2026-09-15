@@ -49,7 +49,13 @@ async def extract_info(url: str) -> dict | None:
             }
 
     info = await ytdlp.extract_info(url)
-    return _tiktok_thumbnail_fallback(url, info) if info else None
+    if not info:
+        return None
+    if tiktok.is_tiktok_url(url):
+        # Reuse the already resolved/normalised URL when the user presses a
+        # download button instead of following the short link a second time.
+        info["_download_url"] = url
+    return _tiktok_thumbnail_fallback(url, info)
 
 
 def _tiktok_thumbnail_fallback(url: str, info: dict) -> dict:
@@ -99,12 +105,18 @@ download_twitter_media = twitter.download_media
 
 async def _download_direct_files(urls: list[str], extension: str) -> list[str]:
     loop = asyncio.get_running_loop()
-    paths = []
-    for url in urls:
+    semaphore = asyncio.Semaphore(4)
+
+    async def _download_one(url: str) -> str | None:
         destination = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.{extension}")
-        if await loop.run_in_executor(None, download_file, url, destination):
-            paths.append(destination)
-    return paths
+        async with semaphore:
+            downloaded = await loop.run_in_executor(
+                None, download_file, url, destination
+            )
+        return destination if downloaded else None
+
+    paths = await asyncio.gather(*(_download_one(url) for url in urls))
+    return [path for path in paths if path]
 
 
 async def download_detected_photo(media_url: str) -> list[str]:
@@ -121,13 +133,37 @@ async def download_detected_photo(media_url: str) -> list[str]:
 
 
 async def download_media(
-    url: str, media_type: str, playlist_items: str | None = None
+    url: str,
+    media_type: str,
+    playlist_items: str | None = None,
+    media_info: dict | None = None,
 ) -> list[str]:
     """Download video, audio, or gallery media from a supported URL."""
     loop = asyncio.get_running_loop()
 
+    if twitter.is_twitter_url(url):
+        media = (media_info or {}).get("_twitter_media")
+        if not media:
+            media = await loop.run_in_executor(None, twitter.extract_media, url)
+        if media and media.get("type") in {"video", "gif"}:
+            media_urls = media.get("urls") or []
+            if media_urls:
+                # FxTwitter already resolved the post to a public CDN URL. Going
+                # back through the yt-dlp Twitter extractor here can require
+                # authentication even though the media itself is downloadable.
+                if media_type == "video":
+                    files = await twitter.download_media(media_urls[:1])
+                else:
+                    files = await ytdlp.download(
+                        media_urls[0], media_type, playlist_items
+                    )
+                if files:
+                    return files
+
     if instagram.is_instagram_url(url):
-        media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
+        media = (media_info or {}).get("_instagram_media")
+        if not media:
+            media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
         if media:
             if media.get("type") in {"photo", "image"}:
                 return await _download_direct_files([media["url"]], "jpg")
@@ -136,7 +172,9 @@ async def download_media(
                 return files
 
     if reddit.is_reddit_url(url):
-        media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
+        media = (media_info or {}).get("_reddit_media")
+        if not media:
+            media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
         if media:
             if media.get("type") in {"photo", "image"}:
                 return await _download_direct_files([media["url"]], "jpg")
@@ -144,5 +182,7 @@ async def download_media(
             if files:
                 return files
 
-    download_url = tiktok.normalize_url(url) if tiktok.is_tiktok_url(url) else url
+    download_url = (media_info or {}).get("_download_url")
+    if not download_url:
+        download_url = tiktok.normalize_url(url) if tiktok.is_tiktok_url(url) else url
     return await ytdlp.download(download_url, media_type, playlist_items)
