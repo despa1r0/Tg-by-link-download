@@ -336,8 +336,8 @@ async def handle_link(message: Message, state: FSMContext):
     await state.clear()
     if is_instagram_reel_url(text):
         await message.reply(
-            "Скачивание Instagram Reels временно недоступно. "
-            "Обычные посты Instagram поддерживаются — пришлите ссылку на пост (/p/)."
+            "Ya washych reelsov rot shatal, poka nie robit "
+            "You can still download normal instagram posts or videos please wait for the next patch, thank you <3 (/p/)."
         )
         return
     msg = await message.reply("Analyzing link… ⏳")
