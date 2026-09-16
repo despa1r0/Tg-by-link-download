@@ -1,4 +1,5 @@
 import os
+import asyncio
 import re
 import logging
 import time
@@ -16,6 +17,7 @@ from bot.services.downloader import (
     download_media, extract_info, is_gallery, get_gallery_count,
     download_detected_photo, download_tiktok_photos, download_twitter_media,
 )
+from bot.services.providers.common import file_media_type
 from bot.services.converter import convert_to_gif
 from bot.config import DOWNLOADS_DIR
 from bot.services.providers.instagram import is_instagram_url
@@ -66,6 +68,7 @@ def _compact_media_info(info: dict | None) -> dict:
     if not info:
         return {}
     reusable_keys = (
+        "_media",
         "_twitter_media",
         "_instagram_media",
         "_reddit_media",
@@ -239,7 +242,13 @@ async def process_gallery_selection(message: Message, state: FSMContext):
     url = data.get("url")
     total = data.get("gallery_count", 0)
     cache_id = tuple(data.get("gallery_cache_id", ()))
-    photo_urls = gallery_cache.get(cache_id, []) if cache_id else []
+    _purge_cache()
+    if cache_id not in url_cache:
+        await state.clear()
+        await message.answer("Session expired. Please send the link again.")
+        return
+    photo_urls = gallery_cache.get(cache_id, [])
+    media_info = media_info_cache.get(cache_id)
     await state.clear()
 
     if not url:
@@ -252,14 +261,20 @@ async def process_gallery_selection(message: Message, state: FSMContext):
     else:
         parts = [p.strip() for p in text.replace(" ", ",").split(",") if p.strip()]
         nums = []
+        invalid = False
         for part in parts:
             range_match = re.match(r"^(\d+)\s*-\s*(\d+)$", part)
             if range_match:
                 a, b = int(range_match.group(1)), int(range_match.group(2))
+                if not 1 <= a <= b <= total:
+                    invalid = True
+                    break
                 nums.extend(range(a, b + 1))
             elif part.isdigit():
                 nums.append(int(part))
-        if not nums:
+            else:
+                invalid = True
+        if invalid or not nums or any(n < 1 or n > total for n in nums):
             await message.answer(
                 "Could not understand your selection.\n"
                 "Send numbers like `1,3` or `1-3` or `all`."
@@ -272,7 +287,7 @@ async def process_gallery_selection(message: Message, state: FSMContext):
             return
         indices = sorted(set(nums))
 
-    status_msg = await message.answer("Downloading selected photos… ⏳")
+    status_msg = await message.answer("Downloading selected media… ⏳")
 
     # Use the appropriate downloader based on the cached source
     source = gallery_source_cache.get(cache_id, '') if cache_id else ''
@@ -282,27 +297,18 @@ async def process_gallery_selection(message: Message, state: FSMContext):
         files = await download_tiktok_photos(photo_urls, indices)
     else:
         playlist_items = ",".join(str(n) for n in indices) if indices else None
-        files = await download_media(url, "gallery", playlist_items=playlist_items)
+        files = await download_media(url, "gallery", playlist_items=playlist_items, media_info=media_info)
 
     # Clean up gallery cache
     if cache_id:
         _drop_cache(cache_id)
 
     if not files:
-        await status_msg.edit_text("Failed to download photos.")
+        await status_msg.edit_text("Failed to download media.")
         return
 
     try:
-        media_group = []
-        for f in files:
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                media_group.append(InputMediaPhoto(media=FSInputFile(f)))
-            else:
-                media_group.append(InputMediaVideo(media=FSInputFile(f)))
-
-        if media_group:
-            for i in range(0, len(media_group), 10):
-                await message.answer_media_group(media_group[i:i + 10])
+        await _send_album(message, files)
 
         await status_msg.edit_text("Done! ✅")
     except Exception as e:
@@ -343,7 +349,32 @@ async def handle_link(message: Message, state: FSMContext):
             await msg.edit_text("Could not analyze this link. It may be private or unsupported.")
         return
 
-    # ── Twitter/X media (GIF, photo, photos, video) ──
+    # Shared photo/album controls reuse the ordered metadata during download.
+    detected = info.get("_media")
+    if detected and detected["type"] == "photo":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Download Photo", callback_data="dl_photo")],
+            [InlineKeyboardButton(text="Cancel", callback_data="dl_cancel")],
+        ])
+        await msg.edit_text("Photo detected! Choose an action:", reply_markup=keyboard)
+        cache_id = _cache_key(msg)
+        _store_cache(cache_id, text, info)
+        photo_url_cache[cache_id] = detected["items"][0]["url"]
+        return
+    if detected and len(detected["items"]) > 1:
+        count = len(detected["items"])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Download All Media", callback_data="dl_gallery_all")],
+            [InlineKeyboardButton(text="Pick Specific Items", callback_data="dl_gallery_pick")],
+            [InlineKeyboardButton(text="Cancel", callback_data="dl_cancel")],
+        ])
+        await msg.edit_text(f"Media album: {count} items. Choose an action:", reply_markup=keyboard)
+        _store_cache(_cache_key(msg), text, info)
+        return
+    if info.get("entries") is not None and not detected:
+        await msg.edit_text("Please send a link to a single post or video, rather than a playlist.")
+        return
+
     twitter_media = info.get('_twitter_media') if info else None
     if twitter_media:
         tw_type = twitter_media.get('type')
@@ -378,7 +409,7 @@ async def handle_link(message: Message, state: FSMContext):
                 await msg.edit_text("Failed to download photo.")
                 return
             try:
-                await message.answer_photo(FSInputFile(filepath))
+                await _send_file(message, filepath)
                 await msg.edit_text("Done! ✅")
             except Exception as e:
                 logger.error("Failed to send Twitter photo: %s", e)
@@ -556,16 +587,15 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     # ── Gallery ──
     if action == "gallery":
         sub_action = parts[2] if len(parts) > 2 else "all"
-        data = await state.get_data()
-        cache_id = tuple(data.get("gallery_cache_id", ()))
-        photo_urls = gallery_cache.get(cache_id, []) if cache_id else []
+        cache_id = cache_key
+        photo_urls = gallery_cache.get(cache_id, [])
+        count = len((media_info or {}).get("_media", {}).get("items", [])) or len(photo_urls)
 
         if sub_action == "pick":
-            count = data.get("gallery_count", "?")
-            await state.update_data(url=url)
+            await state.update_data(url=url, gallery_count=count, gallery_cache_id=list(cache_id))
             await state.set_state(BotStates.waiting_for_gallery_selection)
             await callback.message.edit_text(
-                f"There are **{count}** photos.\n"
+                f"There are **{count}** media items.\n"
                 "Reply with the numbers you want to download.\n"
                 "Examples: `1,3` or `1-3` or `all`.",
                 parse_mode="Markdown",
@@ -573,7 +603,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             return
 
         # sub_action == "all" — download all photos
-        await callback.message.edit_text("Downloading all photos… ⏳")
+        await callback.message.edit_text("Downloading all media… ⏳")
 
         source = gallery_source_cache.get(cache_id, '') if cache_id else ''
         if photo_urls and source == 'twitter':
@@ -590,18 +620,10 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         _drop_cache(cache_key)
 
         if not files:
-            await callback.message.edit_text("Failed to download photos.")
+            await callback.message.edit_text("Failed to download media.")
             return
         try:
-            media_group = []
-            for f in files:
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                    media_group.append(InputMediaPhoto(media=FSInputFile(f)))
-                else:
-                    media_group.append(InputMediaVideo(media=FSInputFile(f)))
-            if media_group:
-                for i in range(0, len(media_group), 10):
-                    await callback.message.answer_media_group(media_group[i:i + 10])
+            await _send_album(callback.message, files)
             await callback.message.edit_text("Done! ✅")
         except Exception as e:
             logger.error("Gallery send error: %s", e)
@@ -676,7 +698,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             return
 
         try:
-            await callback.message.answer_photo(FSInputFile(filepath))
+            await _send_file(callback.message, filepath)
             await callback.message.edit_text("Done! ✅")
         except Exception as exc:
             logger.error("Failed to send detected photo: %s", exc)
@@ -701,14 +723,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     try:
-        # Detect actual file type by extension to select the proper send method
-        ext = filepath.lower().split('.')[-1]
-        if ext in ('jpg', 'jpeg', 'png', 'webp'):
-            await callback.message.answer_photo(FSInputFile(filepath))
-        elif ext in ('mp3', 'm4a', 'wav', 'ogg') or action == "audio":
-            await callback.message.answer_audio(FSInputFile(filepath))
-        else:
-            await callback.message.answer_video(FSInputFile(filepath))
+        await _send_file(callback.message, filepath)
         await callback.message.edit_text("Done! ✅")
     except Exception as e:
         logger.error(f"Error sending downloaded file: {e}")
@@ -757,3 +772,29 @@ async def _convert_uploaded_video(
     finally:
         if os.path.exists(gif_path):
             os.remove(gif_path)
+
+
+async def _send_file(message: Message, path: str):
+    kind = await asyncio.to_thread(file_media_type, path)
+    method = {"photo": message.answer_photo, "video": message.answer_video,
+              "audio": message.answer_audio, "animation": message.answer_animation}.get(kind)
+    if method is None:
+        raise ValueError("Unrecognized media content")
+    await method(FSInputFile(path))
+
+
+async def _send_album(message: Message, files: list[str]):
+    # Telegram albums require 2-10 photos/videos; send a remaining item alone.
+    kinds = [await asyncio.to_thread(file_media_type, path) for path in files]
+    if any(kind not in {"photo", "video"} for kind in kinds):
+        raise ValueError("Album contains unrecognized media")
+    for offset in range(0, len(files), 10):
+        chunk = files[offset:offset + 10]
+        if len(chunk) == 1:
+            await _send_file(message, chunk[0])
+        else:
+            group = [
+                (InputMediaPhoto if kind == "photo" else InputMediaVideo)(media=FSInputFile(path))
+                for path, kind in zip(chunk, kinds[offset:offset + 10])
+            ]
+            await message.answer_media_group(group)

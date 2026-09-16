@@ -5,6 +5,7 @@ import os
 import uuid
 
 import yt_dlp
+from bot.services.providers.instagram_ytdlp import InstagramIE
 
 from bot.config import (
     DOWNLOADS_DIR,
@@ -124,12 +125,20 @@ def _base_options() -> dict:
     return options
 
 
+def _metadata_format(context: dict):
+    # Metadata also needs explicit image-only formats from Instagram photos.
+    formats = context.get("formats") or []
+    if formats:
+        yield formats[-1]
+
+
 async def extract_info(url: str) -> dict | None:
-    options = {**_base_options(), "skip_download": True}
+    options = {**_base_options(), "skip_download": True, "format": _metadata_format}
 
     def _extract():
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.add_info_extractor(InstagramIE())
                 return ydl.extract_info(url, download=False)
         except Exception as exc:
             logger.warning("yt-dlp metadata extraction failed for %s: %s", url, exc)
@@ -165,6 +174,7 @@ async def download(url: str, media_type: str, playlist_items: str | None = None)
 
     def _download():
         with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.add_info_extractor(InstagramIE())
             ydl.extract_info(url, download=True)
 
     try:

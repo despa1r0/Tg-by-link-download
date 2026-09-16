@@ -7,6 +7,7 @@ import urllib.request
 import uuid
 
 from bot.config import DOWNLOADS_DIR
+from bot.services.media_model import media_result
 from bot.services.providers.common import download_file, hostname_matches, resolve_url
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,15 @@ def extract_media(url: str) -> dict | None:
         return None
 
     title = (tweet.get("text") or "Twitter Media")[:120]
+    if len(all_media) > 1:
+        items = []
+        for entry in all_media:
+            kind = "photo" if entry.get("type") in {"photo", "image"} else "video"
+            media_url = entry.get("url") if kind == "photo" else _best_video_url(entry)
+            if not media_url:
+                return None
+            items.append({"type": kind, "url": media_url})
+        return media_result(items, title)
     gif_types = {"gif", "animated_gif"}
     gif_item = next((item for item in all_media if item.get("type") in gif_types), None)
     if gif_item:

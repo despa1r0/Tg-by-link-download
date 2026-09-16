@@ -1,10 +1,13 @@
 import html as html_module
 import logging
+import json
 import re
 import urllib.parse
 import urllib.request
 
 from bot.services.providers.common import hostname_matches, resolve_url
+from bot.services.media_model import media_result
+from bot.services.providers.instagram import _meta_content
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,30 @@ def extract_proxy_media(url: str) -> dict | None:
     parsed = urllib.parse.urlsplit(resolved)
     if not hostname_matches(resolved, REDDIT_DOMAINS):
         return None
+
+    if "/gallery/" in parsed.path or "/comments/" in parsed.path:
+        # Native metadata preserves gallery order, unlike an embed's OG preview.
+        json_url = urllib.parse.urlunsplit(("https", "www.reddit.com", parsed.path.rstrip("/") + ".json", "raw_json=1", ""))
+        try:
+            request = urllib.request.Request(json_url, headers={"User-Agent": "TelegramMediaBot/1.0"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read(2 * 1024 * 1024))
+            post = payload[0]["data"]["children"][0]["data"]
+            if post.get("gallery_data"):
+                items = []
+                for child in post["gallery_data"]["items"]:
+                    metadata = post["media_metadata"][child["media_id"]]
+                    source = metadata.get("s") or {}
+                    video_url = source.get("mp4")
+                    media_url = video_url or source.get("u")
+                    if not media_url:
+                        return None
+                    items.append({"type": "video" if video_url else "photo", "url": html_module.unescape(media_url)})
+                return media_result(items, post.get("title", "Reddit Media"))
+        except (ValueError, KeyError, IndexError, TypeError, OSError) as exc:
+            logger.debug("Reddit structured metadata unavailable: %s", exc)
+        if "/gallery/" in parsed.path:
+            return None  # Never present the gallery's cover as the whole post.
 
     proxy_url = urllib.parse.urlunsplit(
         ("https", "vxreddit.com", parsed.path, parsed.query, "")
@@ -49,6 +76,8 @@ def extract_proxy_media(url: str) -> dict | None:
     if video_match:
         return {"type": "video", "url": html_module.unescape(video_match.group(1)), "title": title}
 
+    if (_meta_content(page, "og:type") or "").startswith("video"):
+        return None
     image_match = re.search(r'<meta property="og:image" content="([^"]+)"', page)
     if not image_match:
         return None

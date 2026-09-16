@@ -1,5 +1,7 @@
 import logging
 import os
+import json
+import subprocess
 import urllib.parse
 import urllib.request
 
@@ -42,6 +44,9 @@ def download_file(url: str, destination: str) -> bool:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            if content_type in {"text/html", "application/json", "text/plain"}:
+                raise ValueError("server returned a page instead of media")
             content_length = response.headers.get("Content-Length")
             if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
                 raise ValueError("remote file exceeds configured size limit")
@@ -53,9 +58,36 @@ def download_file(url: str, destination: str) -> bool:
                     if downloaded > MAX_DOWNLOAD_BYTES:
                         raise ValueError("remote file exceeds configured size limit")
                     output.write(chunk)
+        if file_media_type(destination) is None:
+            raise ValueError("downloaded file is not recognized media")
         return True
     except Exception as exc:
         logger.warning("Media download failed for %s: %s", url, exc)
         if os.path.exists(destination):
             os.remove(destination)
         return False
+
+
+def file_media_type(path: str) -> str | None:
+    """Identify bytes/streams, never trust a CDN URL's filename extension."""
+    with open(path, "rb") as source:
+        header = source.read(32)
+    if header.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n")) or (
+        header.startswith(b"RIFF") and header[8:12] == b"WEBP"
+    ):
+        return "photo"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "animation"
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-of", "json", path],
+            capture_output=True, timeout=15, check=True,
+        )
+        streams = json.loads(result.stdout).get("streams", [])
+        if any(stream.get("codec_type") == "video" and not stream.get("disposition", {}).get("attached_pic") for stream in streams):
+            return "video"
+        if any(stream.get("codec_type") == "audio" for stream in streams):
+            return "audio"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return None

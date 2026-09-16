@@ -8,6 +8,7 @@ import uuid
 from bot.config import DOWNLOADS_DIR
 from bot.services.providers import instagram, reddit, tiktok, twitter, ytdlp
 from bot.services.providers.common import download_file
+from bot.services.media_model import from_ytdlp, media_result
 
 
 async def extract_info(url: str) -> dict | None:
@@ -17,7 +18,7 @@ async def extract_info(url: str) -> dict | None:
     if tiktok.is_tiktok_url(url):
         photo_urls = await loop.run_in_executor(None, tiktok.extract_photos, url)
         if photo_urls:
-            return {"_tiktok_photos": photo_urls, "extractor_key": "TikTok"}
+            return {"_media": media_result([{ "type": "photo", "url": value} for value in photo_urls]), "extractor_key": "TikTok"}
         url = tiktok.normalize_url(url)
 
     if twitter.is_twitter_url(url):
@@ -25,69 +26,78 @@ async def extract_info(url: str) -> dict | None:
         if media:
             return {
                 "_twitter_media": media,
+                **({"_media": media} if media.get("items") else {}),
                 "extractor_key": "Twitter",
                 "title": media.get("title"),
             }
 
-    # Prefer embed proxies for sites that frequently block anonymous VPS traffic.
-    if instagram.is_instagram_url(url):
-        media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
+    # Resolve the complete post before accepting a proxy's single preview.
+    if instagram.is_instagram_url(url) or reddit.is_reddit_url(url):
+        info = await ytdlp.extract_info(url)
+        if info and (result := from_ytdlp(info, url)):
+            return {**info, "_media": result}
+        provider = instagram if instagram.is_instagram_url(url) else reddit
+        media = await loop.run_in_executor(None, provider.extract_proxy_media, url)
         if media:
-            return {
-                "_instagram_media": media,
-                "extractor_key": "Instagram",
-                "title": media.get("title"),
-            }
-
-    if reddit.is_reddit_url(url):
-        media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
-        if media:
-            return {
-                "_reddit_media": media,
-                "extractor_key": "Reddit",
-                "title": media.get("title"),
-            }
+            return {"_media": _provider_result(media), "extractor_key": provider.__name__.rsplit(".", 1)[-1]}
+        return None
 
     info = await ytdlp.extract_info(url)
     if not info:
         return None
-    if tiktok.is_tiktok_url(url):
-        # Reuse the already resolved/normalised URL when the user presses a
-        # download button instead of following the short link a second time.
-        info["_download_url"] = url
-    return _tiktok_thumbnail_fallback(url, info)
+    info["_download_url"] = url
+    if result := from_ytdlp(info, url):
+        info["_media"] = result
+    return info
+
+
+def _provider_result(media: dict) -> dict:
+    if media.get("items"):
+        return media
+    kind = "photo" if media["type"] in {"photo", "image", "photos"} else "video"
+    urls = media.get("urls") or [media["url"]]
+    return media_result([{"type": kind, "url": url} for url in urls], media.get("title", ""))
 
 
 def _tiktok_thumbnail_fallback(url: str, info: dict) -> dict:
-    if not tiktok.is_tiktok_url(url):
-        return info
-    has_video = bool(info.get("vcodec") and info.get("vcodec") != "none")
-    if has_video:
-        return info
-    thumbnails = []
-    for thumbnail in info.get("thumbnails", []):
-        thumbnail_url = thumbnail.get("url", "")
-        if thumbnail_url and thumbnail_url not in thumbnails:
-            thumbnails.append(thumbnail_url)
-    return {"_tiktok_photos": thumbnails, "extractor_key": "TikTok"} if thumbnails else info
+    # Thumbnails cannot prove that a post contains photos (audio/video previews).
+    return info
 
 
 def is_gallery(info: dict) -> bool:
     if not info:
         return False
-    if "_tiktok_photos" in info:
-        return True
-    entries = info.get("entries")
-    return bool(entries and len(list(entries)) > 1)
+    if "_media" in info:
+        return len(info["_media"]["items"]) > 1
+    return bool(info.get("_tiktok_photos"))
 
 
 def get_gallery_count(info: dict) -> int:
     if not info:
         return 0
-    if "_tiktok_photos" in info:
-        return len(info["_tiktok_photos"])
-    entries = info.get("entries")
-    return len(list(entries)) if entries else 1
+    if "_media" in info:
+        return len(info["_media"]["items"])
+    return len(info.get("_tiktok_photos") or [])
+
+
+async def download_items(items: list[dict], indices: list[int] | None = None) -> list[str]:
+    """Download every selected child in source order, without silent partial albums."""
+    files = []
+    for index, item in enumerate(items, 1):
+        if indices is not None and index not in indices:
+            continue
+        if item.get("download") == "ytdlp":
+            child = item.get("index")
+            paths = await ytdlp.download(item["url"], "video", str(child) if child else None)
+        else:
+            paths = await _download_direct_files([item["url"]], "jpg" if item["type"] == "photo" else "mp4")
+        if not paths:
+            for path in files:
+                if os.path.exists(path):
+                    os.remove(path)
+            return []
+        files.extend(paths)
+    return files
 
 
 async def download_tiktok_photos(
@@ -141,6 +151,14 @@ async def download_media(
     """Download video, audio, or gallery media from a supported URL."""
     loop = asyncio.get_running_loop()
 
+    detected = (media_info or {}).get("_media")
+    if detected:
+        items = detected["items"]
+        if media_type == "audio":
+            return await ytdlp.download(items[0]["url"], "audio", playlist_items)
+        indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
+        return await download_items(items, indices)
+
     if twitter.is_twitter_url(url):
         media = (media_info or {}).get("_twitter_media")
         if not media:
@@ -165,6 +183,9 @@ async def download_media(
         if not media:
             media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
         if media:
+            if media.get("items"):
+                indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
+                return await download_items(media["items"], indices)
             if media.get("type") in {"photo", "image"}:
                 return await _download_direct_files([media["url"]], "jpg")
             files = await ytdlp.download(media["url"], media_type, playlist_items)
@@ -176,6 +197,9 @@ async def download_media(
         if not media:
             media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
         if media:
+            if media.get("items"):
+                indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
+                return await download_items(media["items"], indices)
             if media.get("type") in {"photo", "image"}:
                 return await _download_direct_files([media["url"]], "jpg")
             files = await ytdlp.download(media["url"], media_type, playlist_items)
