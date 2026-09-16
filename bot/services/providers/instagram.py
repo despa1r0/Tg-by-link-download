@@ -19,6 +19,13 @@ def is_instagram_url(url: str) -> bool:
     return hostname_matches(url, INSTAGRAM_DOMAINS)
 
 
+def is_instagram_reel_url(url: str) -> bool:
+    if not is_instagram_url(url):
+        return False
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path).lower()
+    return bool(re.match(r"^/(?:[^/]+/)?reels?(?:/|$)", path))
+
+
 def extract_proxy_media(url: str) -> dict | None:
     """Resolve public Instagram media through embed proxies.
 

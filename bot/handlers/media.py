@@ -20,7 +20,7 @@ from bot.services.downloader import (
 from bot.services.providers.common import file_media_type
 from bot.services.converter import convert_to_gif
 from bot.config import DOWNLOADS_DIR
-from bot.services.providers.instagram import is_instagram_url
+from bot.services.providers.instagram import is_instagram_url, is_instagram_reel_url
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +334,12 @@ async def handle_link(message: Message, state: FSMContext):
 
     # A state-less FSM context may still contain data from the previous link.
     await state.clear()
+    if is_instagram_reel_url(text):
+        await message.reply(
+            "Скачивание Instagram Reels временно недоступно. "
+            "Обычные посты Instagram поддерживаются — пришлите ссылку на пост (/p/)."
+        )
+        return
     msg = await message.reply("Analyzing link… ⏳")
 
     info = await extract_info(text)
