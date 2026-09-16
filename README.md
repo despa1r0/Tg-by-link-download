@@ -32,11 +32,17 @@ That's it! The bot is now running.
 
 ## CI/CD (GitHub Actions)
 
-The `.github/workflows/deploy.yml` workflow runs on every push to `master` (and
-can also be started manually from `master`). It runs the unit tests, builds the
-Docker image in GitHub Actions, publishes immutable commit and `latest` tags to
-GitHub Container Registry (GHCR), and then tells the production server to pull
-and start the immutable commit image.
+The workflow has two jobs:
+
+1. **Tests:** one Python 3.12 run on pushes and pull requests to `develop` and
+   `master`, or a manual run. No build matrix, duplicate lint jobs or external
+   social-network requests.
+2. **Build and deploy:** only after passing tests on `master`, outside pull
+   requests. Build one Docker image, push its immutable commit tag to GHCR,
+   then pull and restart the bot over SSH. Pushes to `develop` never deploy.
+
+Deployments are serialized per branch. There is no `latest` tag; use the commit
+SHA shown by the successful workflow when selecting an image manually.
 
 Create a protected GitHub environment named `production` and add these
 environment secrets:
@@ -44,7 +50,7 @@ environment secrets:
 | Secret | Value |
 | --- | --- |
 | `DEPLOY_HOST` | Server hostname or IPv4 address, for example `bot.example.com` |
-| `DEPLOY_PORT` | SSH port, for example `22` |
+| `DEPLOY_PORT` | SSH port; defaults to `22` |
 | `DEPLOY_USER` | Unprivileged SSH user used for deployment |
 | `DEPLOY_SSH_KEY` | Private OpenSSH key for that user |
 | `DEPLOY_KNOWN_HOSTS` | The server's complete trusted `known_hosts` line |
@@ -62,7 +68,7 @@ Prepare the server once:
    one-time clone is fine, but the deployment user does not need Git access and
    the workflow never updates the repository on the server.
 3. Create `DEPLOY_PATH/.env` from `.env.example` and set
-   `BOT_IMAGE=ghcr.io/despa1r0/tg-by-link-download:latest` for manual Compose
+   `BOT_IMAGE=ghcr.io/despa1r0/tg-by-link-download:<deployed-commit-sha>` for manual Compose
    commands.
    Keep the real `.env` only on the server; the workflow does not overwrite or
    upload it. Create any mounted cookie file on the server in the path configured
@@ -83,3 +89,28 @@ If `docker-compose.yml` itself changes, update that one deployment file on the
 server separately. Configure required reviewers for the `production`
 environment if deployments need manual approval, and protect `master` so CI
 must pass before changes are merged.
+
+## Media detection and local checks
+
+Instagram photos and carousels use an adapted yt-dlp extractor that preserves
+explicit photo items alongside videos. The tested yt-dlp version is pinned;
+run the regression tests before updating it. Structured proxy metadata is the
+fallback. An ambiguous `og:image` alone is not accepted as an Instagram photo.
+Twitter mixed posts and Reddit JSON galleries preserve item order. Playlists
+are not offered as photo albums, and TikTok thumbnails are not treated as photos.
+
+The bot sends mixed albums in groups of up to ten and a remaining single item
+separately. Downloaded bytes and FFprobe streams determine the Telegram media
+method. Local execution needs **FFmpeg and FFprobe on PATH**, both already
+included in the Docker image.
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+The fixtures in `tests/fixtures` are synthetic, anonymized examples of provider
+payload shapes, not captured live posts. Tests cover extraction, buttons,
+cache reuse, ordering and Telegram send methods without contacting Telegram or
+social networks. Real-site availability still depends on cookies, rate limits
+and the external providers.
