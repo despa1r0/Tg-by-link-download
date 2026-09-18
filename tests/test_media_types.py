@@ -182,6 +182,18 @@ class MediaFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("dl_photo", callbacks)
             self.assertEqual(media.media_info_cache[(1, 2)]["_media"], result)
 
+    @patch("bot.handlers.media.extract_info", new_callable=AsyncMock)
+    async def test_instagram_reel_reaches_media_extractor(self, extract):
+        url = "https://www.instagram.com/reel/abc/"
+        extract.return_value = None
+        message = AsyncMock()
+        message.text = url
+
+        await media.handle_link(message, AsyncMock())
+
+        extract.assert_awaited_once_with(url)
+        message.reply.assert_awaited_once_with("Analyzing link… ⏳")
+
     @patch("bot.handlers.media._send_album", new_callable=AsyncMock)
     @patch("bot.handlers.media.download_media", new_callable=AsyncMock)
     async def test_old_album_button_uses_its_own_cache(self, download, send):

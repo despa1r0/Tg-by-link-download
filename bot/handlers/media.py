@@ -34,7 +34,7 @@ from bot.services.downloader import (
     is_gallery,
 )
 from bot.services.providers.common import file_media_type
-from bot.services.providers.instagram import is_instagram_reel_url, is_instagram_url
+from bot.services.providers.instagram import is_instagram_url
 
 logger = logging.getLogger(__name__)
 
@@ -424,12 +424,6 @@ async def handle_link(message: Message, state: FSMContext):
 
     # A state-less FSM context may still contain data from the previous link.
     await state.clear()
-    if is_instagram_reel_url(text):
-        await message.reply(
-            "Ya washych reelsov rot shatal, poka nie robit.\n"
-            "You can still download normal instagram posts or videos please wait for the next patch, thank you <3."
-        )
-        return
     msg = await message.reply("Analyzing link… ⏳")
 
     info = await _run_observed(
