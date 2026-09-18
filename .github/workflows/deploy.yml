@@ -202,7 +202,7 @@ jobs:
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
 
-          remote_command="set -eu; cd '$DEPLOY_PATH'; BOT_IMAGE='$IMAGE_REF' docker compose config --images | grep -Fx -- '$IMAGE_REF' >/dev/null; BOT_IMAGE='$IMAGE_REF' docker compose pull bot loki alloy; BOT_IMAGE='$IMAGE_REF' docker compose up -d --no-build --remove-orphans bot loki alloy"
+          remote_command="set -eu; cd '$DEPLOY_PATH'; BOT_IMAGE='$IMAGE_REF' docker compose config --images | grep -Fx -- '$IMAGE_REF' >/dev/null; BOT_IMAGE='$IMAGE_REF' docker compose pull bot loki alloy; docker rm -f tg_media_bot >/dev/null 2>&1 || true; BOT_IMAGE='$IMAGE_REF' docker compose up -d --no-build --remove-orphans bot loki alloy"
 
           ssh "${ssh_options[@]}" -- \
             "$DEPLOY_USER@$DEPLOY_HOST" "$remote_command"

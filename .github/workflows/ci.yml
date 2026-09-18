@@ -49,6 +49,8 @@ jobs:
           expected_image="ghcr.io/example/tg-by-link-download:test"
           BOT_IMAGE="$expected_image" docker compose config --images |
             grep -Fx -- "$expected_image"
+          BOT_IMAGE="$expected_image" docker compose config --format json |
+            python -c 'import json, sys; assert "container_name" not in json.load(sys.stdin)["services"]["bot"]'
 
       - name: Lint
         run: ruff check bot tests
