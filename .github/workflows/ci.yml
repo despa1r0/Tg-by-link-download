@@ -46,6 +46,9 @@ jobs:
           python -m compileall -q bot tests
           cp .env.example .env
           docker compose config --quiet
+          expected_image="ghcr.io/example/tg-by-link-download:test"
+          BOT_IMAGE="$expected_image" docker compose config --images |
+            grep -Fx -- "$expected_image"
 
       - name: Lint
         run: ruff check bot tests
