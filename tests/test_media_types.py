@@ -1,10 +1,12 @@
 import json
 import os
-from pathlib import Path
 import tempfile
 import unittest
-import yt_dlp
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+import yt_dlp
+from test_providers import FakeResponse
 
 from bot.handlers import media
 from bot.services import downloader
@@ -12,7 +14,6 @@ from bot.services.media_model import from_ytdlp, media_result
 from bot.services.providers import instagram, reddit, twitter, ytdlp
 from bot.services.providers.common import download_file, file_media_type
 from bot.services.providers.instagram_ytdlp import InstagramIE
-from test_providers import FakeResponse
 
 
 class MediaTypesTests(unittest.TestCase):

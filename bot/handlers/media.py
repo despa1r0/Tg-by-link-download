@@ -1,26 +1,40 @@
-import os
 import asyncio
-import re
 import logging
+import os
+import re
 import time
 import urllib.parse
-from aiogram import Router, F
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, InputMediaPhoto, InputMediaVideo,
-)
+import uuid
+from typing import Any, Awaitable
+
+from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import StateFilter
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 
+from bot.config import DOWNLOADS_DIR
+from bot.observability import log_context, log_media_failure, request_context
+from bot.services.converter import convert_to_gif
 from bot.services.downloader import (
-    download_media, extract_info, is_gallery, get_gallery_count,
-    download_detected_photo, download_tiktok_photos, download_twitter_media,
+    download_detected_photo,
+    download_media,
+    download_tiktok_photos,
+    download_twitter_media,
+    extract_info,
+    get_gallery_count,
+    is_gallery,
 )
 from bot.services.providers.common import file_media_type
-from bot.services.converter import convert_to_gif
-from bot.config import DOWNLOADS_DIR
-from bot.services.providers.instagram import is_instagram_url, is_instagram_reel_url
+from bot.services.providers.instagram import is_instagram_reel_url, is_instagram_url
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +60,52 @@ media_info_cache: dict[CacheKey, dict] = {}
 cache_expiry: dict[CacheKey, float] = {}
 CACHE_TTL_SECONDS = 15 * 60
 MAX_CACHE_ENTRIES = 1000
+
+
+async def _run_observed(
+    message: Message | CallbackQuery,
+    url: str | None,
+    stage: str,
+    media_type: str,
+    operation: Awaitable[Any],
+    *,
+    empty_is_failure: bool = True,
+) -> Any:
+    """Run a media operation with correlated context and log empty results."""
+    with log_context(
+        **request_context(message, url),
+        download_stage=stage,
+        media_type=media_type,
+    ):
+        try:
+            result = await operation
+        except Exception as exc:
+            log_media_failure(
+                logger, stage=stage, error=exc, url=url, media_type=media_type
+            )
+            return None
+        if empty_is_failure and not result:
+            log_media_failure(
+                logger,
+                stage=stage,
+                error="Operation returned no media files",
+                url=url,
+                media_type=media_type,
+            )
+        return result
+
+
+def _report_failure(
+    message: Message | CallbackQuery,
+    url: str | None,
+    stage: str,
+    media_type: str,
+    error: Exception | str,
+) -> None:
+    with log_context(**request_context(message, url)):
+        log_media_failure(
+            logger, stage=stage, error=error, url=url, media_type=media_type
+        )
 
 
 def _drop_cache(cache_key: CacheKey) -> None:
@@ -170,7 +230,13 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
 
     status_msg = await message.answer("Downloading video for GIF conversion… ⏳")
 
-    files = await download_media(url, "video", media_info=media_info)
+    files = await _run_observed(
+        message,
+        url,
+        "download_for_gif",
+        "video",
+        download_media(url, "video", media_info=media_info),
+    )
     filepath = files[0] if files else None
 
     if not filepath:
@@ -178,7 +244,13 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
         return
 
     await status_msg.edit_text("Converting to GIF… ⏳")
-    gif_path = await convert_to_gif(filepath, start_time, end_time)
+    gif_path = await _run_observed(
+        message,
+        url,
+        "convert_to_gif",
+        "gif",
+        convert_to_gif(filepath, start_time, end_time),
+    )
 
     if os.path.exists(filepath):
         os.remove(filepath)
@@ -190,7 +262,8 @@ async def process_gif_timestamps(message: Message, state: FSMContext):
     try:
         await message.answer_animation(FSInputFile(gif_path))
         await status_msg.edit_text("Done! ✅")
-    except Exception:
+    except Exception as exc:
+        _report_failure(message, url, "send_to_telegram", "gif", exc)
         await status_msg.edit_text("Failed to send GIF. It might be too large.")
     finally:
         if os.path.exists(gif_path):
@@ -292,12 +365,29 @@ async def process_gallery_selection(message: Message, state: FSMContext):
     # Use the appropriate downloader based on the cached source
     source = gallery_source_cache.get(cache_id, '') if cache_id else ''
     if photo_urls and source == 'twitter':
-        files = await download_twitter_media(photo_urls, indices)
+        files = await _run_observed(
+            message, url, "download_gallery", "gallery",
+            download_twitter_media(photo_urls, indices),
+        )
     elif photo_urls:
-        files = await download_tiktok_photos(photo_urls, indices)
+        files = await _run_observed(
+            message, url, "download_gallery", "gallery",
+            download_tiktok_photos(photo_urls, indices),
+        )
     else:
         playlist_items = ",".join(str(n) for n in indices) if indices else None
-        files = await download_media(url, "gallery", playlist_items=playlist_items, media_info=media_info)
+        files = await _run_observed(
+            message,
+            url,
+            "download_gallery",
+            "gallery",
+            download_media(
+                url,
+                "gallery",
+                playlist_items=playlist_items,
+                media_info=media_info,
+            ),
+        )
 
     # Clean up gallery cache
     if cache_id:
@@ -312,7 +402,7 @@ async def process_gallery_selection(message: Message, state: FSMContext):
 
         await status_msg.edit_text("Done! ✅")
     except Exception as e:
-        logger.error("Failed to send gallery: %s", e)
+        _report_failure(message, url, "send_to_telegram", "gallery", e)
         await status_msg.edit_text("Failed to send some files.")
     finally:
         for f in files:
@@ -342,7 +432,9 @@ async def handle_link(message: Message, state: FSMContext):
         return
     msg = await message.reply("Analyzing link… ⏳")
 
-    info = await extract_info(text)
+    info = await _run_observed(
+        message, text, "extract_metadata", "unknown", extract_info(text)
+    )
 
     if not info:
         if is_instagram_url(text):
@@ -385,12 +477,12 @@ async def handle_link(message: Message, state: FSMContext):
     if twitter_media:
         tw_type = twitter_media.get('type')
         tw_urls = twitter_media.get('urls', [])
-        tw_title = twitter_media.get('title', '')
-
         # GIF — auto-download and send as animation
         if tw_type == 'gif' and tw_urls:
             await msg.edit_text("🎞 GIF detected! Downloading… ⏳")
-            files = await download_twitter_media(tw_urls)
+            files = await _run_observed(
+                message, text, "download_media", "gif", download_twitter_media(tw_urls)
+            )
             filepath = files[0] if files else None
             if not filepath:
                 await msg.edit_text("Failed to download GIF.")
@@ -399,7 +491,7 @@ async def handle_link(message: Message, state: FSMContext):
                 await message.answer_animation(FSInputFile(filepath))
                 await msg.edit_text("Done! ✅")
             except Exception as e:
-                logger.error("Failed to send Twitter GIF: %s", e)
+                _report_failure(message, text, "send_to_telegram", "gif", e)
                 await msg.edit_text("Failed to send GIF. It might be too large.")
             finally:
                 if os.path.exists(filepath):
@@ -409,7 +501,9 @@ async def handle_link(message: Message, state: FSMContext):
         # Single photo — auto-download and send
         if tw_type == 'photo' and tw_urls:
             await msg.edit_text("📷 Photo detected! Downloading… ⏳")
-            files = await download_twitter_media(tw_urls)
+            files = await _run_observed(
+                message, text, "download_media", "photo", download_twitter_media(tw_urls)
+            )
             filepath = files[0] if files else None
             if not filepath:
                 await msg.edit_text("Failed to download photo.")
@@ -418,7 +512,7 @@ async def handle_link(message: Message, state: FSMContext):
                 await _send_file(message, filepath)
                 await msg.edit_text("Done! ✅")
             except Exception as e:
-                logger.error("Failed to send Twitter photo: %s", e)
+                _report_failure(message, text, "send_to_telegram", "photo", e)
                 await msg.edit_text("Failed to send photo.")
             finally:
                 if os.path.exists(filepath):
@@ -613,11 +707,23 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
 
         source = gallery_source_cache.get(cache_id, '') if cache_id else ''
         if photo_urls and source == 'twitter':
-            files = await download_twitter_media(photo_urls)
+            files = await _run_observed(
+                callback, url, "download_gallery", "gallery",
+                download_twitter_media(photo_urls),
+            )
         elif photo_urls:
-            files = await download_tiktok_photos(photo_urls)
+            files = await _run_observed(
+                callback, url, "download_gallery", "gallery",
+                download_tiktok_photos(photo_urls),
+            )
         else:
-            files = await download_media(url, "gallery", media_info=media_info)
+            files = await _run_observed(
+                callback,
+                url,
+                "download_gallery",
+                "gallery",
+                download_media(url, "gallery", media_info=media_info),
+            )
 
         # Clean up
         await state.clear()
@@ -632,7 +738,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             await _send_album(callback.message, files)
             await callback.message.edit_text("Done! ✅")
         except Exception as e:
-            logger.error("Gallery send error: %s", e)
+            _report_failure(callback, url, "send_to_telegram", "gallery", e)
             await callback.message.edit_text("Failed to send some files.")
         finally:
             for f in files:
@@ -650,14 +756,26 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(
                 f"Video is only {duration}s — converting the full video to GIF… ⏳"
             )
-            files = await download_media(url, "video", media_info=media_info)
+            files = await _run_observed(
+                callback,
+                url,
+                "download_for_gif",
+                "video",
+                download_media(url, "video", media_info=media_info),
+            )
             filepath = files[0] if files else None
             if not filepath:
                 await callback.message.edit_text("Failed to download video.")
                 _drop_cache(cache_key)
                 await state.clear()
                 return
-            gif_path = await convert_to_gif(filepath, "0", str(duration))
+            gif_path = await _run_observed(
+                callback,
+                url,
+                "convert_to_gif",
+                "gif",
+                convert_to_gif(filepath, "0", str(duration)),
+            )
             if os.path.exists(filepath):
                 os.remove(filepath)
             if not gif_path:
@@ -668,7 +786,10 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             try:
                 await callback.message.answer_animation(FSInputFile(gif_path))
                 await callback.message.edit_text("Done! ✅")
-            except Exception:
+            except Exception as exc:
+                _report_failure(
+                    callback, url, "send_to_telegram", "gif", exc
+                )
                 await callback.message.edit_text("Failed to send GIF. It might be too large.")
             finally:
                 if os.path.exists(gif_path):
@@ -694,7 +815,13 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     # ── Download photo ──
     if action == "photo":
         await callback.message.edit_text("Downloading photo… ⏳")
-        files = await download_detected_photo(photo_url_cache.get(cache_key, ""))
+        files = await _run_observed(
+            callback,
+            url,
+            "download_media",
+            "photo",
+            download_detected_photo(photo_url_cache.get(cache_key, "")),
+        )
         filepath = files[0] if files else None
 
         if not filepath:
@@ -707,7 +834,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             await _send_file(callback.message, filepath)
             await callback.message.edit_text("Done! ✅")
         except Exception as exc:
-            logger.error("Failed to send detected photo: %s", exc)
+            _report_failure(callback, url, "send_to_telegram", "photo", exc)
             await callback.message.edit_text("Failed to send photo.")
         finally:
             if os.path.exists(filepath):
@@ -719,7 +846,13 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     # ── Download video / audio ──
     await callback.message.edit_text("Processing your request… ⏳")
 
-    files = await download_media(url, action, media_info=media_info)
+    files = await _run_observed(
+        callback,
+        url,
+        "download_media",
+        action,
+        download_media(url, action, media_info=media_info),
+    )
     filepath = files[0] if files else None
 
     if not filepath:
@@ -732,7 +865,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
         await _send_file(callback.message, filepath)
         await callback.message.edit_text("Done! ✅")
     except Exception as e:
-        logger.error(f"Error sending downloaded file: {e}")
+        _report_failure(callback, url, "send_to_telegram", action, e)
         await callback.message.edit_text("Failed to send file. It might be over Telegram's 50MB limit.")
     finally:
         if os.path.exists(filepath):
@@ -753,15 +886,41 @@ async def _convert_uploaded_video(
 
     try:
         file = await message.bot.get_file(file_id)
-    except Exception:
+    except Exception as exc:
+        _report_failure(message, None, "retrieve_telegram_file", "video", exc)
         await status_msg.edit_text("Could not retrieve the video file. Please send it again.")
         return
 
-    input_path = os.path.join(DOWNLOADS_DIR, f"{file_id}.mp4")
-    await message.bot.download_file(file.file_path, destination=input_path)
+    # Telegram file IDs are credentials for retrieving a file; never put them in
+    # filenames where downstream tools may echo them into logs.
+    input_path = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.mp4")
+    downloaded = await _run_observed(
+        message,
+        None,
+        "download_telegram_file",
+        "video",
+        message.bot.download_file(file.file_path, destination=input_path),
+        empty_is_failure=False,
+    )
+    if not downloaded and not os.path.exists(input_path):
+        _report_failure(
+            message,
+            None,
+            "download_telegram_file",
+            "video",
+            "Telegram download completed without creating a file",
+        )
+        await status_msg.edit_text("Failed to download the uploaded video.")
+        return
 
     await status_msg.edit_text("Converting to GIF… ⏳")
-    gif_path = await convert_to_gif(input_path, start_time, end_time)
+    gif_path = await _run_observed(
+        message,
+        None,
+        "convert_to_gif",
+        "gif",
+        convert_to_gif(input_path, start_time, end_time),
+    )
 
     if os.path.exists(input_path):
         os.remove(input_path)
@@ -773,7 +932,8 @@ async def _convert_uploaded_video(
     try:
         await message.answer_animation(FSInputFile(gif_path))
         await status_msg.edit_text("Done! ✅")
-    except Exception:
+    except Exception as exc:
+        _report_failure(message, None, "send_to_telegram", "gif", exc)
         await status_msg.edit_text("Failed to send GIF. It might be too large.")
     finally:
         if os.path.exists(gif_path):

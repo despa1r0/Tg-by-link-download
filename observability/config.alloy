@@ -1,0 +1,80 @@
+// Collect only the bot container's stdout/stderr JSON logs.
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "bot" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "bot"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "bot" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.bot.output
+  labels     = { service_name = "tg-media-bot", environment = "production" }
+  forward_to = [loki.process.bot.receiver]
+}
+
+loki.process "bot" {
+  stage.json {
+    expressions = {
+      timestamp       = "",
+      level           = "",
+      event           = "",
+      source_platform = "",
+      request_id      = "",
+      download_stage  = "",
+      media_type      = "",
+      error_type      = "",
+      source_host     = "",
+      source_url_hash = "",
+      user_ref        = "",
+    }
+  }
+
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339Nano"
+  }
+
+  // Keep only stable, low-cardinality dimensions as indexed labels.
+  stage.labels {
+    values = {
+      level           = "",
+      event           = "",
+      source_platform = "",
+    }
+  }
+
+  // Request and error details remain searchable without creating log streams.
+  stage.structured_metadata {
+    values = {
+      request_id      = "",
+      download_stage  = "",
+      media_type      = "",
+      error_type      = "",
+      source_host     = "",
+      source_url_hash = "",
+      user_ref        = "",
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

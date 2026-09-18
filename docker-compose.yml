@@ -7,5 +7,38 @@ services:
       - .env
     volumes:
       - ./downloads:/app/downloads
-      # Uncomment when YTDLP_COOKIES_FILE=/app/secrets/cookies.txt is configured.
-      # - ./cookies.txt:/app/secrets/cookies.txt:ro
+      # Put an optional Netscape-format cookies.txt in ./secrets on the host.
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      - loki
+
+  loki:
+    image: grafana/loki:3.7.0
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      # Loki has no built-in authentication, so do not expose it publicly.
+      - "127.0.0.1:${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./observability/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/tmp/loki
+
+  alloy:
+    image: grafana/alloy:v1.19.2
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./observability/config.alloy:/etc/alloy/config.alloy:ro
+      # Read-only still grants broad Docker API visibility; protect this host.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
+
+volumes:
+  loki-data:
+  alloy-data:

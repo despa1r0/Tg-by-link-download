@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -95,7 +96,6 @@ def _best_video_url(media: dict) -> str:
 
 async def download_media(urls: list[str], indices: list[int] | None = None) -> list[str]:
     selected = [url for index, url in enumerate(urls, 1) if indices is None or index in indices]
-    loop = asyncio.get_running_loop()
     semaphore = asyncio.Semaphore(4)
 
     async def _download_one(media_url: str) -> str | None:
@@ -104,8 +104,9 @@ async def download_media(urls: list[str], indices: list[int] | None = None) -> l
             extension = "jpg"
         destination = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.{extension}")
         async with semaphore:
-            downloaded = await loop.run_in_executor(
-                None, download_file, media_url, destination
+            context = contextvars.copy_context()
+            downloaded = await asyncio.get_running_loop().run_in_executor(
+                None, context.run, download_file, media_url, destination
             )
         return destination if downloaded else None
 

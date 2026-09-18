@@ -1,11 +1,12 @@
+import json
 import logging
 import os
-import json
 import subprocess
 import urllib.parse
 import urllib.request
 
 from bot.config import MAX_DOWNLOAD_BYTES
+from bot.observability import log_media_failure, safe_url_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,15 @@ def resolve_url(url: str, short_domains: tuple[str, ...]) -> str:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.url
     except Exception as exc:
-        logger.warning("Could not resolve short URL %s: %s", url, exc)
+        logger.warning(
+            "Could not resolve short URL",
+            extra={
+                "event": "url_resolution_failed",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                **safe_url_metadata(url),
+            },
+        )
         return url
 
 
@@ -62,7 +71,7 @@ def download_file(url: str, destination: str) -> bool:
             raise ValueError("downloaded file is not recognized media")
         return True
     except Exception as exc:
-        logger.warning("Media download failed for %s: %s", url, exc)
+        log_media_failure(logger, stage="write_file", error=exc, url=url)
         if os.path.exists(destination):
             os.remove(destination)
         return False

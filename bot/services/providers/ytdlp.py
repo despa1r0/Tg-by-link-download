@@ -1,11 +1,11 @@
 import asyncio
+import contextvars
 import glob
 import logging
 import os
 import uuid
 
 import yt_dlp
-from bot.services.providers.instagram_ytdlp import InstagramIE
 
 from bot.config import (
     DOWNLOADS_DIR,
@@ -13,6 +13,8 @@ from bot.config import (
     YTDLP_CONCURRENCY,
     YTDLP_COOKIES_FILE,
 )
+from bot.observability import log_media_failure
+from bot.services.providers.instagram_ytdlp import InstagramIE
 
 logger = logging.getLogger(__name__)
 VIDEO_SELECTION_MAX_BYTES = max(1, int(MAX_DOWNLOAD_BYTES * 0.98))
@@ -141,11 +143,14 @@ async def extract_info(url: str) -> dict | None:
                 ydl.add_info_extractor(InstagramIE())
                 return ydl.extract_info(url, download=False)
         except Exception as exc:
-            logger.warning("yt-dlp metadata extraction failed for %s: %s", url, exc)
+            log_media_failure(logger, stage="extract_metadata", error=exc, url=url)
             return None
 
     async with _YTDLP_SEMAPHORE:
-        return await asyncio.get_running_loop().run_in_executor(None, _extract)
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            None, context.run, _extract
+        )
 
 
 async def download(url: str, media_type: str, playlist_items: str | None = None) -> list[str]:
@@ -179,9 +184,18 @@ async def download(url: str, media_type: str, playlist_items: str | None = None)
 
     try:
         async with _YTDLP_SEMAPHORE:
-            await asyncio.get_running_loop().run_in_executor(None, _download)
+            context = contextvars.copy_context()
+            await asyncio.get_running_loop().run_in_executor(
+                None, context.run, _download
+            )
     except Exception as exc:
-        logger.warning("yt-dlp download failed for %s: %s", url, exc)
+        log_media_failure(
+            logger,
+            stage="download_media",
+            error=exc,
+            url=url,
+            media_type=media_type,
+        )
         _cleanup(unique_id)
         return []
 
@@ -194,7 +208,13 @@ async def download(url: str, media_type: str, playlist_items: str | None = None)
         if os.path.getsize(path) <= MAX_DOWNLOAD_BYTES:
             accepted.append(path)
         else:
-            logger.warning("Downloaded file exceeds configured size limit: %s", path)
+            log_media_failure(
+                logger,
+                stage="validate_file_size",
+                error="Downloaded file exceeds configured size limit",
+                url=url,
+                media_type=media_type,
+            )
             os.remove(path)
     return accepted
 

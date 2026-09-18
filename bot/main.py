@@ -1,14 +1,21 @@
 import asyncio
 import logging
+
 from aiogram import Bot, Dispatcher
+
 from bot.config import BOT_TOKEN
 from bot.handlers import commands, media
+from bot.observability import configure_logging
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
+logger = logging.getLogger(__name__)
 
 async def main():
     if not BOT_TOKEN:
-        logging.error("BOT_TOKEN is not set. Please set it in your .env file.")
+        logger.error(
+            "BOT_TOKEN is not configured",
+            extra={"event": "configuration_error", "error_type": "MissingBotToken"},
+        )
         return
         
     bot = Bot(token=BOT_TOKEN)
@@ -17,7 +24,7 @@ async def main():
     dp.include_router(commands.router)
     dp.include_router(media.router)
 
-    logging.info("Starting bot polling...")
+    logger.info("Starting bot polling", extra={"event": "bot_started"})
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

@@ -1,28 +1,35 @@
 """Public download API and platform-provider orchestration."""
 
 import asyncio
+import contextvars
 import os
 import urllib.parse
 import uuid
 
 from bot.config import DOWNLOADS_DIR
+from bot.services.media_model import from_ytdlp, media_result
 from bot.services.providers import instagram, reddit, tiktok, twitter, ytdlp
 from bot.services.providers.common import download_file
-from bot.services.media_model import from_ytdlp, media_result
+
+
+async def _run_sync(function, *args):
+    """Run blocking provider work without losing the request logging context."""
+    context = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(
+        None, context.run, function, *args
+    )
 
 
 async def extract_info(url: str) -> dict | None:
     """Extract metadata, using specialized providers before/after yt-dlp as needed."""
-    loop = asyncio.get_running_loop()
-
     if tiktok.is_tiktok_url(url):
-        photo_urls = await loop.run_in_executor(None, tiktok.extract_photos, url)
+        photo_urls = await _run_sync(tiktok.extract_photos, url)
         if photo_urls:
             return {"_media": media_result([{ "type": "photo", "url": value} for value in photo_urls]), "extractor_key": "TikTok"}
         url = tiktok.normalize_url(url)
 
     if twitter.is_twitter_url(url):
-        media = await loop.run_in_executor(None, twitter.extract_media, url)
+        media = await _run_sync(twitter.extract_media, url)
         if media:
             return {
                 "_twitter_media": media,
@@ -37,7 +44,7 @@ async def extract_info(url: str) -> dict | None:
         if info and (result := from_ytdlp(info, url)):
             return {**info, "_media": result}
         provider = instagram if instagram.is_instagram_url(url) else reddit
-        media = await loop.run_in_executor(None, provider.extract_proxy_media, url)
+        media = await _run_sync(provider.extract_proxy_media, url)
         if media:
             return {"_media": _provider_result(media), "extractor_key": provider.__name__.rsplit(".", 1)[-1]}
         return None
@@ -114,15 +121,12 @@ download_twitter_media = twitter.download_media
 
 
 async def _download_direct_files(urls: list[str], extension: str) -> list[str]:
-    loop = asyncio.get_running_loop()
     semaphore = asyncio.Semaphore(4)
 
     async def _download_one(url: str) -> str | None:
         destination = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.{extension}")
         async with semaphore:
-            downloaded = await loop.run_in_executor(
-                None, download_file, url, destination
-            )
+            downloaded = await _run_sync(download_file, url, destination)
         return destination if downloaded else None
 
     paths = await asyncio.gather(*(_download_one(url) for url in urls))
@@ -149,8 +153,6 @@ async def download_media(
     media_info: dict | None = None,
 ) -> list[str]:
     """Download video, audio, or gallery media from a supported URL."""
-    loop = asyncio.get_running_loop()
-
     detected = (media_info or {}).get("_media")
     if detected:
         items = detected["items"]
@@ -162,7 +164,7 @@ async def download_media(
     if twitter.is_twitter_url(url):
         media = (media_info or {}).get("_twitter_media")
         if not media:
-            media = await loop.run_in_executor(None, twitter.extract_media, url)
+            media = await _run_sync(twitter.extract_media, url)
         if media and media.get("type") in {"video", "gif"}:
             media_urls = media.get("urls") or []
             if media_urls:
@@ -181,7 +183,7 @@ async def download_media(
     if instagram.is_instagram_url(url):
         media = (media_info or {}).get("_instagram_media")
         if not media:
-            media = await loop.run_in_executor(None, instagram.extract_proxy_media, url)
+            media = await _run_sync(instagram.extract_proxy_media, url)
         if media:
             if media.get("items"):
                 indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
@@ -195,7 +197,7 @@ async def download_media(
     if reddit.is_reddit_url(url):
         media = (media_info or {}).get("_reddit_media")
         if not media:
-            media = await loop.run_in_executor(None, reddit.extract_proxy_media, url)
+            media = await _run_sync(reddit.extract_proxy_media, url)
         if media:
             if media.get("items"):
                 indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None

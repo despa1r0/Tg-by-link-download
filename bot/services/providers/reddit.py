@@ -1,12 +1,12 @@
 import html as html_module
-import logging
 import json
+import logging
 import re
 import urllib.parse
 import urllib.request
 
-from bot.services.providers.common import hostname_matches, resolve_url
 from bot.services.media_model import media_result
+from bot.services.providers.common import hostname_matches, resolve_url
 from bot.services.providers.instagram import _meta_content
 
 logger = logging.getLogger(__name__)

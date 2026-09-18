@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 .env
 cookies*.txt
+secrets/*
+!secrets/.gitkeep
 downloads/
 .DS_Store

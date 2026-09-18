@@ -1,0 +1,208 @@
+name: Build and deploy
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the selected commit after building it
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker_build:
+    name: Build and publish Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.image.outputs.ref }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare immutable and release image tags
+        id: image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          image_ref="${repository}:${GITHUB_SHA}"
+
+          {
+            echo "ref=${image_ref}"
+            echo "tags<<EOF"
+            echo "${image_ref}"
+            if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+              [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+              echo "${repository}:${GITHUB_REF_NAME}"
+              echo "${repository}:latest"
+            else
+              echo "${repository}:edge"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  verify_image:
+    name: Verify deployment image exists
+    needs: docker_build
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect immutable image in registry
+        env:
+          IMAGE_REF: ${{ needs.docker_build.outputs.image_ref }}
+        run: |
+          set -Eeuo pipefail
+          : "${IMAGE_REF:?Docker image reference is missing}"
+          docker buildx imagetools inspect "$IMAGE_REF"
+
+  deploy:
+    name: Deploy to production
+    needs:
+      - docker_build
+      - verify_image
+    if: >-
+      always() &&
+      needs.verify_image.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out deployment configuration
+        uses: actions/checkout@v4
+
+      - name: Deploy verified image over SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          IMAGE_REF: ${{ needs.docker_build.outputs.image_ref }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          required_vars=(
+            DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_PATH
+            IMAGE_REF GHCR_USER GHCR_TOKEN
+          )
+          missing_vars=()
+          for name in "${required_vars[@]}"; do
+            [[ -n "${!name-}" ]] || missing_vars+=("$name")
+          done
+          if (( ${#missing_vars[@]} )); then
+            echo "Missing required variables: ${missing_vars[*]}" >&2
+            exit 1
+          fi
+
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]+$ ]]
+          [[ "$DEPLOY_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]
+
+          key_file="${RUNNER_TEMP}/deploy_key"
+          trap 'rm -f "$key_file"' EXIT
+
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$key_file"
+          chmod 600 "$key_file"
+
+          ssh_options=(
+            -i "$key_file"
+            -p "$DEPLOY_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=accept-new
+          )
+
+          ssh "${ssh_options[@]}" -- "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p '$DEPLOY_PATH/observability' '$DEPLOY_PATH/secrets' '$DEPLOY_PATH/downloads'"
+
+          scp \
+            -i "$key_file" \
+            -P "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=accept-new \
+            -- \
+            docker-compose.yml \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/docker-compose.yml"
+
+          scp \
+            -i "$key_file" \
+            -P "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=accept-new \
+            -- \
+            observability/config.alloy \
+            observability/loki-config.yml \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/observability/"
+
+          printf '%s' "$GHCR_TOKEN" | ssh "${ssh_options[@]}" -- \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+
+          remote_command="set -eu; cd '$DEPLOY_PATH'; BOT_IMAGE='$IMAGE_REF' docker compose pull bot loki alloy; BOT_IMAGE='$IMAGE_REF' docker compose up -d --no-build --remove-orphans bot loki alloy"
+
+          ssh "${ssh_options[@]}" -- \
+            "$DEPLOY_USER@$DEPLOY_HOST" "$remote_command"

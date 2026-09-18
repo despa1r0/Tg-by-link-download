@@ -1,9 +1,12 @@
 import asyncio
+import contextvars
+import logging
 import math
 import os
 import uuid
-import logging
+
 import ffmpeg
+
 from bot.config import DOWNLOADS_DIR, FFMPEG_CONCURRENCY
 
 logger = logging.getLogger(__name__)
@@ -20,7 +23,15 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
     Returns the output path on success, or None on failure.
     """
     if not os.path.exists(input_path):
-        logger.error("convert_to_gif: input file does not exist: %s", input_path)
+        logger.error(
+            "GIF conversion input file does not exist",
+            extra={
+                "event": "media_operation_failed",
+                "download_stage": "convert_to_gif",
+                "error_type": "FileNotFoundError",
+                "error_message": "Input media file does not exist",
+            },
+        )
         return None
 
     try:
@@ -83,8 +94,10 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
                 os.remove(output_path)
 
     async with _FFMPEG_SEMAPHORE:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _convert)
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            None, context.run, _convert
+        )
 
 
 def _timestamp_to_seconds(value: str) -> int | float:
