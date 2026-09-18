@@ -22,7 +22,9 @@ A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok,
    Instagram Reels and other restricted posts may require authenticated cookies.
    Put a Netscape-format file at `secrets/cookies.txt` and set
    `YTDLP_COOKIES_FILE=/app/secrets/cookies.txt`. The `secrets/` directory is
-   already mounted read-only and its contents are ignored by Git.
+   mounted read-only and its contents are ignored by Git and the Docker build
+   context. For every yt-dlp operation, the bot creates a private `0600` runtime
+   copy and removes it immediately afterward.
 
 3. Build and start the bot, Loki, and Grafana Alloy in the background:
    ```bash

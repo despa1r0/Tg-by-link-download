@@ -20,6 +20,13 @@ _LOG_CONTEXT: contextvars.ContextVar[dict[str, object] | None] = contextvars.Con
     "log_context", default=None
 )
 _URL_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+_SENSITIVE_HEADER_PATTERN = re.compile(
+    r"(?i)\b(cookie|set-cookie|authorization|proxy-authorization)\s*:\s*[^\r\n]+"
+)
+_COOKIE_VALUE_PATTERN = re.compile(
+    r"(?i)\b(sessionid|csrftoken|ds_user_id|ig_did|mid|datr|rur)\s*([=:])\s*"
+    r"[^\s;,]+"
+)
 _STANDARD_LOG_RECORD_FIELDS = set(logging.makeLogRecord({}).__dict__)
 
 
@@ -163,4 +170,8 @@ def _sanitize_text(value: str) -> str:
         fingerprint = metadata["source_url_hash"]
         return f"[url:{host}#{fingerprint}]"
 
+    value = _SENSITIVE_HEADER_PATTERN.sub(lambda match: f"{match.group(1)}: [redacted]", value)
+    value = _COOKIE_VALUE_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]", value
+    )
     return _URL_PATTERN.sub(replace, value).replace("\x00", "")[:4000]

@@ -69,9 +69,12 @@ class ProviderTests(unittest.TestCase):
             "",
             url="https://scontent.example-cdn.test/media/reel.mp4?token=abc",
         )
-        media = instagram.extract_proxy_media("https://www.instagram.com/reel/abc/")
+        media = instagram.extract_proxy_media(
+            "https://www.instagram.com/reel/abc/?stkn=secret&img_index=2"
+        )
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.host, "kkinstagram.com")
+        self.assertEqual(request.host, "instagram7.com")
+        self.assertEqual(request.full_url, "https://instagram7.com/reel/abc/?img_index=2")
         self.assertEqual(media["type"], "video")
         self.assertIn("reel.mp4", media["url"])
 
@@ -97,14 +100,14 @@ class ProviderTests(unittest.TestCase):
             ),
             FakeResponse(
                 '<meta property="og:video:secure_url" content="/videos/abc/1">',
-                url="https://g.ddinstagram.com/p/abc/",
+                url="https://eeinstagram.com/p/abc/",
             ),
         ]
 
         media = instagram.extract_proxy_media("https://www.instagram.com/p/abc/")
 
         self.assertEqual(media["type"], "video")
-        self.assertEqual(media["url"], "https://g.ddinstagram.com/videos/abc/1")
+        self.assertEqual(media["url"], "https://eeinstagram.com/videos/abc/1")
 
     @patch("bot.services.providers.twitter.urllib.request.urlopen")
     def test_twitter_animated_gif_is_classified_as_gif(self, urlopen):

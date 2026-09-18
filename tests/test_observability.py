@@ -70,6 +70,31 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIn("user_ref", context)
         self.assertNotIn("123456789", json.dumps(context))
 
+    def test_json_formatter_redacts_cookie_values_and_auth_headers(self):
+        formatter = JsonFormatter()
+        record = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            __file__,
+            1,
+            "Cookie: sessionid=session-secret; csrftoken=csrf-secret",
+            (),
+            None,
+        )
+        record.error_message = (
+            "sessionid=embedded-secret Authorization: Bearer bearer-secret"
+        )
+
+        serialized = formatter.format(record)
+
+        for secret in (
+            "session-secret",
+            "csrf-secret",
+            "embedded-secret",
+            "bearer-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

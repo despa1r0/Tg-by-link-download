@@ -3,7 +3,11 @@ import contextvars
 import glob
 import logging
 import os
+import shutil
+import tempfile
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import yt_dlp
 
@@ -113,7 +117,38 @@ def _video_options() -> dict:
     }
 
 
-def _base_options() -> dict:
+@contextmanager
+def _runtime_cookie_file() -> Iterator[str | None]:
+    """Give yt-dlp a private writable copy of the read-only cookie secret."""
+    if not YTDLP_COOKIES_FILE:
+        yield None
+        return
+
+    runtime_directory = (
+        "/dev/shm"
+        if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+        else None
+    )
+    descriptor, runtime_path = tempfile.mkstemp(
+        prefix=".yt-dlp-cookies-",
+        suffix=".txt",
+        dir=runtime_directory,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as destination, open(
+            YTDLP_COOKIES_FILE, "rb"
+        ) as source:
+            shutil.copyfileobj(source, destination)
+        os.chmod(runtime_path, 0o600)
+        yield runtime_path
+    finally:
+        try:
+            os.remove(runtime_path)
+        except FileNotFoundError:
+            pass
+
+
+def _base_options(cookiefile: str | None = None) -> dict:
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -122,8 +157,8 @@ def _base_options() -> dict:
         "retries": 3,
         "fragment_retries": 3,
     }
-    if YTDLP_COOKIES_FILE:
-        options["cookiefile"] = YTDLP_COOKIES_FILE
+    if cookiefile:
+        options["cookiefile"] = cookiefile
     return options
 
 
@@ -135,13 +170,17 @@ def _metadata_format(context: dict):
 
 
 async def extract_info(url: str) -> dict | None:
-    options = {**_base_options(), "skip_download": True, "format": _metadata_format}
-
     def _extract():
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.add_info_extractor(InstagramIE())
-                return ydl.extract_info(url, download=False)
+            with _runtime_cookie_file() as cookiefile:
+                options = {
+                    **_base_options(cookiefile),
+                    "skip_download": True,
+                    "format": _metadata_format,
+                }
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    ydl.add_info_extractor(InstagramIE())
+                    return ydl.extract_info(url, download=False)
         except Exception as exc:
             log_media_failure(logger, stage="extract_metadata", error=exc, url=url)
             return None
@@ -178,9 +217,13 @@ async def download(url: str, media_type: str, playlist_items: str | None = None)
         options["noplaylist"] = True
 
     def _download():
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.add_info_extractor(InstagramIE())
-            ydl.extract_info(url, download=True)
+        with _runtime_cookie_file() as cookiefile:
+            operation_options = {**options}
+            if cookiefile:
+                operation_options["cookiefile"] = cookiefile
+            with yt_dlp.YoutubeDL(operation_options) as ydl:
+                ydl.add_info_extractor(InstagramIE())
+                ydl.extract_info(url, download=True)
 
     try:
         async with _YTDLP_SEMAPHORE:

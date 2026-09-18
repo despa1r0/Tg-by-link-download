@@ -11,7 +11,7 @@ from bot.services.providers.common import hostname_matches
 logger = logging.getLogger(__name__)
 
 INSTAGRAM_DOMAINS = ("instagram.com", "instagr.am")
-PROXY_DOMAINS = ("kkinstagram.com", "g.ddinstagram.com", "g.oginstagram.com")
+PROXY_DOMAINS = ("instagram7.com", "eeinstagram.com", "kkinstagram.com")
 EMBED_USER_AGENT = "Mozilla/5.0 (compatible; Discordbot/2.0)"
 
 
@@ -37,8 +37,12 @@ def extract_proxy_media(url: str) -> dict | None:
 
     photo_fallback = None
     for proxy_domain in PROXY_DOMAINS:
+        # Share tokens and tracking parameters are not needed by embed proxies
+        # and must not be disclosed to third-party fallback services.
+        query = urllib.parse.parse_qs(parsed.query).get("img_index", [])
+        safe_query = urllib.parse.urlencode({"img_index": query[0]}) if query else ""
         proxy_url = urllib.parse.urlunsplit(
-            ("https", proxy_domain, parsed.path, parsed.query, "")
+            ("https", proxy_domain, parsed.path, safe_query, "")
         )
         request = urllib.request.Request(proxy_url, headers={"User-Agent": EMBED_USER_AGENT})
         try:
