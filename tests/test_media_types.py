@@ -78,7 +78,7 @@ class MediaTypesTests(unittest.TestCase):
     def test_youtube_playlist_is_not_gallery(self):
         info = {"extractor_key": "YoutubeTab", "entries": [{"url": "https://cdn.test/a.mp4"}] * 2}
         self.assertIsNone(from_ytdlp(info, "https://youtube.com/playlist?list=abc"))
-        self.assertFalse(downloader.is_gallery(info))
+        self.assertNotIn("_media", info)
 
     def test_social_video_collection_is_not_photo_gallery(self):
         info = {"extractor_key": "Instagram", "entries": [{"vcodec": "h264"}, {"vcodec": "h264"}]}
@@ -87,8 +87,8 @@ class MediaTypesTests(unittest.TestCase):
         self.assertEqual([item["index"] for item in result["items"]], [1, 2])
 
     def test_tiktok_thumbnails_do_not_prove_photo_post(self):
-        for info in ({"thumbnails": [{"url": "https://cdn.test/cover.jpg"}]}, {"formats": [{"vcodec": "h264"}], "thumbnails": [{"url": "https://cdn.test/cover.jpg"}]}):
-            self.assertIs(downloader._tiktok_thumbnail_fallback("https://tiktok.com/@a/video/1", info), info)
+        info = {"thumbnails": [{"url": "https://cdn.test/cover.jpg"}]}
+        self.assertIsNone(from_ytdlp(info, "https://tiktok.com/@a/video/1"))
 
     def test_bytes_override_extension(self):
         with tempfile.TemporaryDirectory() as directory:

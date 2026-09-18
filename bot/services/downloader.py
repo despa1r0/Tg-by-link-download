@@ -5,9 +5,10 @@ import contextvars
 import os
 import urllib.parse
 import uuid
+from collections.abc import Mapping, Sequence
 
 from bot.config import DOWNLOADS_DIR
-from bot.services.media_model import from_ytdlp, media_result
+from bot.services.media_model import MediaItem, MediaResult, from_ytdlp, media_result
 from bot.services.providers import instagram, reddit, tiktok, twitter, ytdlp
 from bot.services.providers.common import download_file
 
@@ -25,17 +26,22 @@ async def extract_info(url: str) -> dict | None:
     if tiktok.is_tiktok_url(url):
         photo_urls = await _run_sync(tiktok.extract_photos, url)
         if photo_urls:
-            return {"_media": media_result([{ "type": "photo", "url": value} for value in photo_urls]), "extractor_key": "TikTok"}
+            result = media_result(
+                [MediaItem("photo", url, direct_url=value) for value in photo_urls],
+                source_url=url,
+                provider="tiktok",
+            )
+            return {"_media": result, "extractor_key": "TikTok"}
         url = tiktok.normalize_url(url)
 
     if twitter.is_twitter_url(url):
         media = await _run_sync(twitter.extract_media, url)
         if media:
             return {
-                "_twitter_media": media,
-                **({"_media": media} if media.get("items") else {}),
+                "_media": media,
                 "extractor_key": "Twitter",
                 "title": media.get("title"),
+                "duration": media.get("duration"),
             }
 
     # Resolve the complete post before accepting a proxy's single preview.
@@ -46,7 +52,12 @@ async def extract_info(url: str) -> dict | None:
         provider = instagram if instagram.is_instagram_url(url) else reddit
         media = await _run_sync(provider.extract_proxy_media, url)
         if media:
-            return {"_media": _provider_result(media), "extractor_key": provider.__name__.rsplit(".", 1)[-1]}
+            return {
+                "_media": media,
+                "extractor_key": provider.__name__.rsplit(".", 1)[-1],
+                "title": media.get("title"),
+                "duration": media.get("duration"),
+            }
         return None
 
     info = await ytdlp.extract_info(url)
@@ -58,36 +69,9 @@ async def extract_info(url: str) -> dict | None:
     return info
 
 
-def _provider_result(media: dict) -> dict:
-    if media.get("items"):
-        return media
-    kind = "photo" if media["type"] in {"photo", "image", "photos"} else "video"
-    urls = media.get("urls") or [media["url"]]
-    return media_result([{"type": kind, "url": url} for url in urls], media.get("title", ""))
-
-
-def _tiktok_thumbnail_fallback(url: str, info: dict) -> dict:
-    # Thumbnails cannot prove that a post contains photos (audio/video previews).
-    return info
-
-
-def is_gallery(info: dict) -> bool:
-    if not info:
-        return False
-    if "_media" in info:
-        return len(info["_media"]["items"]) > 1
-    return bool(info.get("_tiktok_photos"))
-
-
-def get_gallery_count(info: dict) -> int:
-    if not info:
-        return 0
-    if "_media" in info:
-        return len(info["_media"]["items"])
-    return len(info.get("_tiktok_photos") or [])
-
-
-async def download_items(items: list[dict], indices: list[int] | None = None) -> list[str]:
+async def download_items(
+    items: Sequence[MediaItem | Mapping], indices: list[int] | None = None
+) -> list[str]:
     """Download every selected child in source order, without silent partial albums."""
     files = []
     for index, item in enumerate(items, 1):
@@ -97,53 +81,60 @@ async def download_items(items: list[dict], indices: list[int] | None = None) ->
             child = item.get("index")
             paths = await ytdlp.download(item["url"], "video", str(child) if child else None)
         else:
-            paths = await _download_direct_files([item["url"]], "jpg" if item["type"] == "photo" else "mp4")
+            extension = "mp4"
+            if item["type"] == "photo":
+                path = urllib.parse.urlsplit(item["url"]).path
+                candidate = path.rsplit(".", 1)[-1].lower() if "." in path else "jpg"
+                extension = candidate if candidate in {"jpg", "jpeg", "png", "webp"} else "jpg"
+            paths = await _download_direct_files(
+                [item["url"]], extension
+            )
         if not paths:
-            for path in files:
-                if os.path.exists(path):
-                    os.remove(path)
+            cleanup_files(files)
             return []
         files.extend(paths)
     return files
 
 
-async def download_tiktok_photos(
-    photo_urls: list[str], indices: list[int] | None = None
-) -> list[str]:
-    selected = [
-        url for index, url in enumerate(photo_urls, 1)
-        if indices is None or index in indices
-    ]
-    return await _download_direct_files(selected, "jpeg")
-
-
-download_twitter_media = twitter.download_media
-
-
 async def _download_direct_files(urls: list[str], extension: str) -> list[str]:
     semaphore = asyncio.Semaphore(4)
+    destinations = [
+        os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.{extension}") for _ in urls
+    ]
 
-    async def _download_one(url: str) -> str | None:
-        destination = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.{extension}")
+    async def _download_one(url: str, destination: str) -> str | None:
         async with semaphore:
             downloaded = await _run_sync(download_file, url, destination)
         return destination if downloaded else None
 
-    paths = await asyncio.gather(*(_download_one(url) for url in urls))
+    batch = asyncio.gather(*(
+        _download_one(url, destination)
+        for url, destination in zip(urls, destinations, strict=True)
+    ))
+    try:
+        # Shield blocking worker threads so cancellation can wait for them and
+        # reliably remove their operation-owned destinations afterward.
+        paths = await asyncio.shield(batch)
+    except asyncio.CancelledError:
+        try:
+            await batch
+        finally:
+            cleanup_files(destinations)
+        raise
+    if any(path is None for path in paths):
+        cleanup_files(destinations)
+        return []
     return [path for path in paths if path]
 
 
-async def download_detected_photo(media_url: str) -> list[str]:
-    """Download a previously detected Instagram or Reddit photo URL."""
-    if not media_url:
-        return []
-
-    path = urllib.parse.urlsplit(media_url).path
-    extension = path.rsplit(".", 1)[-1].lower() if "." in path else "jpg"
-    if extension not in {"jpg", "jpeg", "png", "webp"}:
-        extension = "jpg"
-
-    return await _download_direct_files([media_url], extension)
+def cleanup_files(paths) -> None:
+    """Best-effort cleanup shared by platform adapters and failed operations."""
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 async def download_media(
@@ -153,60 +144,24 @@ async def download_media(
     media_info: dict | None = None,
 ) -> list[str]:
     """Download video, audio, or gallery media from a supported URL."""
-    detected = (media_info or {}).get("_media")
+    detected: MediaResult | Mapping | None = (media_info or {}).get("_media")
+    if not detected and not media_info and any(
+        predicate(url)
+        for predicate in (
+            twitter.is_twitter_url,
+            instagram.is_instagram_url,
+            reddit.is_reddit_url,
+            tiktok.is_tiktok_url,
+        )
+    ):
+        refreshed = await extract_info(url)
+        detected = (refreshed or {}).get("_media")
     if detected:
         items = detected["items"]
         if media_type == "audio":
             return await ytdlp.download(items[0]["url"], "audio", playlist_items)
         indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
         return await download_items(items, indices)
-
-    if twitter.is_twitter_url(url):
-        media = (media_info or {}).get("_twitter_media")
-        if not media:
-            media = await _run_sync(twitter.extract_media, url)
-        if media and media.get("type") in {"video", "gif"}:
-            media_urls = media.get("urls") or []
-            if media_urls:
-                # FxTwitter already resolved the post to a public CDN URL. Going
-                # back through the yt-dlp Twitter extractor here can require
-                # authentication even though the media itself is downloadable.
-                if media_type == "video":
-                    files = await twitter.download_media(media_urls[:1])
-                else:
-                    files = await ytdlp.download(
-                        media_urls[0], media_type, playlist_items
-                    )
-                if files:
-                    return files
-
-    if instagram.is_instagram_url(url):
-        media = (media_info or {}).get("_instagram_media")
-        if not media:
-            media = await _run_sync(instagram.extract_proxy_media, url)
-        if media:
-            if media.get("items"):
-                indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
-                return await download_items(media["items"], indices)
-            if media.get("type") in {"photo", "image"}:
-                return await _download_direct_files([media["url"]], "jpg")
-            files = await ytdlp.download(media["url"], media_type, playlist_items)
-            if files:
-                return files
-
-    if reddit.is_reddit_url(url):
-        media = (media_info or {}).get("_reddit_media")
-        if not media:
-            media = await _run_sync(reddit.extract_proxy_media, url)
-        if media:
-            if media.get("items"):
-                indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
-                return await download_items(media["items"], indices)
-            if media.get("type") in {"photo", "image"}:
-                return await _download_direct_files([media["url"]], "jpg")
-            files = await ytdlp.download(media["url"], media_type, playlist_items)
-            if files:
-                return files
 
     download_url = (media_info or {}).get("_download_url")
     if not download_url:

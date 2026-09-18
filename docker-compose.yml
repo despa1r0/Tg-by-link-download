@@ -6,8 +6,22 @@ services:
     env_file:
       - .env
     volumes:
-      - ./downloads:/app/downloads
+      - telegram-downloads:/app/downloads
       # Put an optional Netscape-format cookies.txt in ./secrets on the host.
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      - loki
+
+  discord:
+    image: ${BOT_IMAGE:-tg-by-link-download:local}
+    build: .
+    command: ["python", "-m", "bot.discord_app.main"]
+    profiles: ["discord"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - discord-downloads:/app/downloads
       - ./secrets:/app/secrets:ro
     depends_on:
       - loki
@@ -40,5 +54,7 @@ services:
       - loki
 
 volumes:
+  telegram-downloads:
+  discord-downloads:
   loki-data:
   alloy-data:

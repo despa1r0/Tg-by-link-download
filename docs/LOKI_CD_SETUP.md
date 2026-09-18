@@ -28,6 +28,12 @@ nano /home/deploy/tg-media-bot/.env
 
 ```dotenv
 BOT_TOKEN=telegram-bot-token
+# Не добавляйте эту строку, если нужен только Telegram.
+DISCORD_BOT_TOKEN=discord-bot-token
+DISCORD_ALLOW_DMS=true
+DISCORD_ALLOWED_CHANNEL_IDS=123456789012345678
+DISCORD_FALLBACK_UPLOAD_MB=20
+DISCORD_ATTACHMENTS_PER_MESSAGE=10
 BOT_IMAGE=ghcr.io/OWNER/REPOSITORY:latest
 
 LOG_LEVEL=INFO
@@ -91,7 +97,9 @@ Push в `master` только собирает SHA-образ и тег `edge`. 
 версионный образ и запускает deploy. Ручной запуск workflow деплоит только при
 включённом input `deploy`.
 
-Workflow не изменяет `.env` и содержимое `secrets/`.
+Workflow не изменяет `.env` и содержимое `secrets/`. Если в `.env` есть
+непустой `DISCORD_BOT_TOKEN`, deploy автоматически включает Compose profile
+`discord`; без него обновляются только Telegram и observability.
 
 ## 4. Проверить Loki после первого deploy
 
@@ -115,7 +123,7 @@ curl -G http://127.0.0.1:3100/loki/api/v1/query_range \
 Если что-то не запустилось:
 
 ```bash
-docker compose logs --tail=200 bot loki alloy
+docker compose --profile discord logs --tail=200 bot discord loki alloy
 ```
 
 Логи хранятся 30 дней в Docker volume `loki-data`.

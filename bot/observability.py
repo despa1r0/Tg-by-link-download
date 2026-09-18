@@ -64,20 +64,30 @@ def source_platform(url: str | None) -> str:
     return "other"
 
 
-def request_context(message, url: str | None = None) -> dict[str, object]:
-    """Build non-sensitive context for correlating one Telegram operation."""
+def request_context(
+    message, url: str | None = None, *, platform: str = "telegram"
+) -> dict[str, object]:
+    """Build non-sensitive context for correlating one adapter operation."""
     context: dict[str, object] = {
         "request_id": uuid.uuid4().hex,
+        "platform": platform,
         "source_platform": source_platform(url),
+        "provider": source_platform(url),
         **safe_url_metadata(url),
     }
     chat = getattr(message, "chat", None)
     if chat is None:
         chat = getattr(getattr(message, "message", None), "chat", None)
+    if chat is None:
+        chat = getattr(message, "channel", None)
     if chat is not None and getattr(chat, "type", None):
         context["chat_type"] = str(chat.type)
 
     user = getattr(message, "from_user", None)
+    if user is None:
+        user = getattr(message, "author", None)
+    if user is None:
+        user = getattr(message, "user", None)
     user_id = getattr(user, "id", None)
     salt = os.getenv("LOG_CONTEXT_SALT", "")
     if user_id is not None and salt:
@@ -121,6 +131,7 @@ def log_media_failure(
             "error_type": error_type,
             "error_message": error_message,
             "source_platform": source_platform(url) if url else None,
+            "provider": source_platform(url) if url else None,
             **safe_url_metadata(url),
         },
     )

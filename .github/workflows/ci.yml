@@ -45,12 +45,13 @@ jobs:
         run: |
           python -m compileall -q bot tests
           cp .env.example .env
-          docker compose config --quiet
+          docker compose --profile discord config --quiet
+          python -c 'import bot.services.media_model, bot.main, bot.discord_app.main'
           expected_image="ghcr.io/example/tg-by-link-download:test"
-          BOT_IMAGE="$expected_image" docker compose config --images |
+          BOT_IMAGE="$expected_image" docker compose --profile discord config --images |
             grep -Fx -- "$expected_image"
-          BOT_IMAGE="$expected_image" docker compose config --format json |
-            python -c 'import json, sys; assert "container_name" not in json.load(sys.stdin)["services"]["bot"]'
+          BOT_IMAGE="$expected_image" docker compose --profile discord config --format json |
+            python -c 'import json, sys; services=json.load(sys.stdin)["services"]; assert {"bot", "discord"} <= services.keys(); assert all("container_name" not in services[name] for name in ("bot", "discord")); assert services["discord"]["command"] == ["python", "-m", "bot.discord_app.main"]'
 
       - name: Lint
         run: ruff check bot tests

@@ -1,9 +1,23 @@
-# Telegram Media Downloader Bot
+# Telegram and Discord Media Downloader Bots
 
-A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok, Instagram, Twitter, and Reddit using `yt-dlp`. It can also convert specific video segments to GIFs.
+Two independent Python bot services share one transport-neutral media core. Both
+accept supported YouTube, TikTok, Instagram, Twitter/X, and Reddit links; extract
+ordered photo/video results; download video or audio; and convert video segments
+to animations. Telegram keeps the existing callback/FSM flow. Discord uses
+owner-only buttons and selects that expire after 15 minutes.
 
 > Telegram stores animations as silent H.264/MPEG-4 videos. Consequently, saving a
 > GIF sent as an animation from a Telegram client normally produces an `.mp4` file.
+
+## Architecture
+
+- `bot/services/` contains the typed `MediaItem`/`MediaResult` contract,
+  providers, downloads, validation, and conversion. It imports neither aiogram
+  nor discord.py.
+- `bot/handlers/` and `bot/main.py` are the Telegram adapter and entrypoint.
+- `bot/discord_app/` is the Discord adapter and independent entrypoint.
+- Each Compose service has a separate downloads volume. Provider metadata is
+  process-local and no database, queue, or shared download directory is used.
 
 ## Deployment (Docker)
 
@@ -16,7 +30,7 @@ A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok,
 2. Configure your environment variables:
    ```bash
    cp .env.example .env
-   # Open .env and add your Telegram BOT_TOKEN
+   # Open .env and configure one or both bot tokens
    ```
 
    Instagram Reels and other restricted posts may require authenticated cookies.
@@ -26,12 +40,57 @@ A lightweight Telegram bot that downloads videos and audio from YouTube, TikTok,
    context. For every yt-dlp operation, the bot creates a private `0600` runtime
    copy and removes it immediately afterward.
 
-3. Build and start the bot, Loki, and Grafana Alloy in the background:
+3. Start Telegram, Loki, and Grafana Alloy:
    ```bash
    docker compose up -d --build
    ```
 
-That's it! The bot is now running.
+   Start Discord as well (or independently) by enabling its profile:
+
+   ```bash
+   docker compose --profile discord up -d --build discord
+   # Telegram only:
+   docker compose up -d --build bot
+   ```
+
+The image defaults to `python -m bot.main`; the Discord service overrides the
+command with `python -m bot.discord_app.main`.
+
+## Discord application setup
+
+A detailed Russian walkthrough is available in
+[`docs/DISCORD_SETUP.md`](docs/DISCORD_SETUP.md).
+
+1. Create an application and bot in the Discord Developer Portal, copy its token
+   to `DISCORD_BOT_TOKEN`, and enable **Message Content Intent**. This adapter
+   reads ordinary link messages, so guild message content must be available;
+   Discord documents it as a privileged intent. DMs remain available regardless
+   of guild intent approval. See Discord's
+   [Message Content documentation](https://support-dev.discord.com/hc/en-us/articles/6207308062871-What-are-Privileged-Intents).
+2. Install the bot with the `bot` scope and grant only the channels it needs:
+   View Channel, Send Messages, Attach Files, and Read Message History.
+3. Set `DISCORD_ALLOWED_CHANNEL_IDS` to a comma-separated allowlist. An empty
+   value disables all guild-channel processing. Set `DISCORD_ALLOW_DMS=false`
+   to disable DMs; it defaults to `true`.
+4. Send a supported link in an allowed channel or DM. Only its author can use
+   the resulting controls. Album selects preserve source order; downloads are
+   split into configured attachment batches. Cancel remains available during a
+   long operation, and temporary files are removed after success, failure, or
+   cancellation.
+
+Discord exposes a guild-specific upload ceiling, which the adapter checks at
+send time. DMs use `DISCORD_FALLBACK_UPLOAD_MB` (20 MB by default). Discord notes
+that upload limits may vary or be experimental, so this value is configuration,
+not provider logic; see the current
+[File Attachments FAQ](https://support.discord.com/hc/en-us/articles/25444343291031-File-Attachments-FAQ).
+
+## Local launch
+
+```bash
+python -m pip install -r requirements.txt
+python -m bot.main                 # requires BOT_TOKEN
+python -m bot.discord_app.main     # requires DISCORD_BOT_TOKEN
+```
 
 ## Media detection and local checks
 
@@ -53,22 +112,24 @@ python -m unittest discover -s tests -v
 ```
 
 The fixtures in `tests/fixtures` are synthetic, anonymized examples of provider
-payload shapes, not captured live posts. Tests cover extraction, buttons,
-cache reuse, ordering and Telegram send methods without contacting Telegram or
-social networks. Real-site availability still depends on cookies, rate limits
-and the external providers.
+payload shapes, not captured live posts. Tests cover typed extraction, single
+Twitter photo/video/audio, mixed albums, Instagram fallback and child indices,
+cache reuse, cleanup, Telegram send methods, Discord channel policy and
+owner-only controls without contacting Telegram, Discord, or social networks.
+Real-site availability still depends on cookies, rate limits, and providers.
 
 ## Centralized logs (Loki)
 
-The bot writes one JSON object per line to stdout. Grafana Alloy discovers the
-Compose `bot` container through the Docker socket, enriches the records, and
-ships them to Loki. Loki persists its data in the `loki-data` Docker volume and
+Both bots write one JSON object per line to stdout. Grafana Alloy discovers the
+Compose `bot` and `discord` containers through the Docker socket, enriches the
+records, and ships them to Loki. Records include `platform=telegram|discord`,
+the source provider, and operation stage. Loki persists data in its volume and
 is reachable only from the server itself at `http://127.0.0.1:3100` by default.
 It must remain behind an authenticated proxy if it is ever exposed remotely.
 
 Media failure events include the platform, operation stage, media type, error
 type and message, request ID, and safe URL metadata. URL paths, query strings,
-credentials, and raw Telegram user IDs are not logged. Set a long random
+credentials, and raw Telegram/Discord user IDs are not logged. Set a long random
 `LOG_CONTEXT_SALT` in `.env` if stable pseudonymous user references are useful
 for correlating repeated failures.
 
@@ -76,10 +137,10 @@ For example, query recent download failures directly from the server:
 
 ```bash
 curl -G http://127.0.0.1:3100/loki/api/v1/query_range \
-  --data-urlencode 'query={service_name="tg-media-bot",event="media_operation_failed"} | json'
+  --data-urlencode 'query={service_name="tg-media-bot",event="media_operation_failed",platform="discord"} | json'
 ```
 
-`level`, `event`, and `source_platform` are low-cardinality Loki labels. Request
+`level`, `event`, `platform`, and `source_platform` are low-cardinality Loki labels. Request
 IDs and failure details are structured metadata and remain in each JSON log
 line, avoiding a high-cardinality stream for every user or URL.
 
@@ -88,7 +149,8 @@ line, avoiding a high-cardinality stream for every user or URL.
 Automation is split into two independent workflows:
 
 - `.github/workflows/ci.yml` validates Python and Compose configuration, runs
-  Ruff, and runs unit tests for pushes and pull requests. Markdown-only and
+  Ruff, imports both entrypoints, and runs all core/Telegram/Discord unit tests
+  for pushes and pull requests. Markdown-only and
   `docs/`-only changes do not start CI.
 - `.github/workflows/deploy.yml` builds and publishes Docker images independently
   of CI. Every `master` build receives immutable `${GITHUB_SHA}` and `edge` tags.
@@ -125,7 +187,10 @@ Prepare the server once:
    upload it. If authenticated extraction is needed, place the cookie file at
    `DEPLOY_PATH/secrets/cookies.txt`, restrict it with `chmod 600`, and configure
    `YTDLP_COOKIES_FILE=/app/secrets/cookies.txt`.
-4. Add the workflow's public SSH key to the deploy user's
+4. Configure `DISCORD_BOT_TOKEN` and the Discord policy variables when the
+   Discord service should be deployed. The deploy script only enables the
+   Discord Compose profile when that token has a non-placeholder value.
+5. Add the workflow's public SSH key to the deploy user's
    `~/.ssh/authorized_keys`.
 
 The deploy job uploads the Compose and observability configuration, then runs

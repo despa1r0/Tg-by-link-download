@@ -5,7 +5,7 @@ import re
 import urllib.parse
 import urllib.request
 
-from bot.services.media_model import media_result
+from bot.services.media_model import MediaItem, MediaResult, media_result
 from bot.services.providers.common import hostname_matches
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ def is_instagram_reel_url(url: str) -> bool:
     return bool(re.match(r"^/(?:[^/]+/)?reels?(?:/|$)", path))
 
 
-def extract_proxy_media(url: str) -> dict | None:
+def extract_proxy_media(url: str) -> MediaResult | None:
     """Resolve public Instagram media through embed proxies.
 
     This avoids Instagram's frequent anonymous-request blocks on VPS IP ranges.
@@ -51,11 +51,12 @@ def extract_proxy_media(url: str) -> dict | None:
                 if not hostname_matches(final_url, PROXY_DOMAINS):
                     media_type = _response_media_type(response, final_url)
                     if media_type:
-                        result = {
-                            "type": media_type,
-                            "url": final_url,
-                            "title": "Instagram Media",
-                        }
+                        result = media_result(
+                            [MediaItem(media_type, url, direct_url=final_url)],
+                            "Instagram Media",
+                            source_url=url,
+                            provider="instagram",
+                        )
                         if media_type == "video":
                             return result
                         if not re.search(r"/(?:reel|reels|tv)/", parsed.path):
@@ -68,7 +69,7 @@ def extract_proxy_media(url: str) -> dict | None:
             logger.warning("Instagram proxy %s failed: %s", proxy_domain, exc)
             continue
 
-        structured = extract_structured_media(page)
+        structured = extract_structured_media(page, source_url=url)
         if structured:
             return structured
 
@@ -86,39 +87,53 @@ def extract_proxy_media(url: str) -> dict | None:
             None,
         )
         if video_url:
-            return {
-                "type": "video",
-                "url": urllib.parse.urljoin(proxy_url, html_module.unescape(video_url)),
-                "title": html_module.unescape(
+            return media_result(
+                [MediaItem(
+                    "video",
+                    url,
+                    direct_url=urllib.parse.urljoin(
+                        proxy_url, html_module.unescape(video_url)
+                    ),
+                )],
+                html_module.unescape(
                     _meta_content(page, "og:title") or "Instagram Media"
                 ),
-            }
+                source_url=url,
+                provider="instagram",
+            )
         image_url = _meta_content(page, "og:image")
         # An OG image alone is often a video poster, not a downloadable photo.
         if image_url and (_meta_content(page, "og:type") or "").lower() in {"image", "photo"} and not re.search(r"/(?:reel|reels|tv)/", parsed.path):
-            photo_fallback = photo_fallback or {
-                "type": "photo",
-                "url": urllib.parse.urljoin(proxy_url, html_module.unescape(image_url)),
-                "title": html_module.unescape(
+            photo_fallback = photo_fallback or media_result(
+                [MediaItem(
+                    "photo",
+                    url,
+                    direct_url=urllib.parse.urljoin(
+                        proxy_url, html_module.unescape(image_url)
+                    ),
+                )],
+                html_module.unescape(
                     _meta_content(page, "og:title") or "Instagram Media"
                 ),
-            }
+                source_url=url,
+                provider="instagram",
+            )
     return photo_fallback
 
 
-def extract_structured_media(page: str) -> dict | None:
+def extract_structured_media(page: str, source_url: str = "") -> MediaResult | None:
     """Read post children from Instagram GraphQL/mobile JSON or JSON-LD."""
     def item(node):
         video = node.get("is_video") or node.get("media_type") == 2 or node.get("@type") == "VideoObject" or node.get("__typename") == "GraphVideo"
         if video:
             versions = node.get("video_versions") or []
             url = node.get("video_url") or node.get("contentUrl") or (versions[0].get("url") if versions else None)
-            return {"type": "video", "url": url} if url else None
+            return MediaItem("video", source_url or url, direct_url=url) if url else None
         candidates = (node.get("image_versions2") or {}).get("candidates") or []
         url = node.get("display_url") or (candidates[0].get("url") if candidates else None)
         if node.get("@type") == "ImageObject":
             url = node.get("contentUrl") or url
-        return {"type": "photo", "url": url} if url else None
+        return MediaItem("photo", source_url or url, direct_url=url) if url else None
 
     def walk(node):
         if isinstance(node, dict):
@@ -126,10 +141,26 @@ def extract_structured_media(page: str) -> dict | None:
             children = [edge.get("node") for edge in edges] if edges else node.get("carousel_media")
             if children:
                 items = [item(child) if isinstance(child, dict) else None for child in children]
-                return media_result(items) if all(items) else None
+                return (
+                    media_result(
+                        items,
+                        source_url=source_url,
+                        provider="instagram",
+                    )
+                    if all(items)
+                    else None
+                )
             if any(key in node for key in ("is_video", "media_type")) or node.get("@type") in {"VideoObject", "ImageObject"} or node.get("__typename") in {"GraphVideo", "GraphImage"}:
                 parsed = item(node)
-                return media_result([parsed]) if parsed else None
+                return (
+                    media_result(
+                        [parsed],
+                        source_url=source_url,
+                        provider="instagram",
+                    )
+                    if parsed
+                    else None
+                )
             for value in node.values():
                 if result := walk(value):
                     return result

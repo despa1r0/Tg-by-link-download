@@ -228,9 +228,19 @@ async def download(url: str, media_type: str, playlist_items: str | None = None)
     try:
         async with _YTDLP_SEMAPHORE:
             context = contextvars.copy_context()
-            await asyncio.get_running_loop().run_in_executor(
+            operation = asyncio.get_running_loop().run_in_executor(
                 None, context.run, _download
             )
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # The worker thread cannot be force-stopped. Let it finish, then
+                # remove every file owned by this cancelled operation.
+                try:
+                    await operation
+                finally:
+                    _cleanup(unique_id)
+                raise
     except Exception as exc:
         log_media_failure(
             logger,

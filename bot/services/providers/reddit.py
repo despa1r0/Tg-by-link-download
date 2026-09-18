@@ -5,7 +5,7 @@ import re
 import urllib.parse
 import urllib.request
 
-from bot.services.media_model import media_result
+from bot.services.media_model import MediaItem, MediaResult, media_result
 from bot.services.providers.common import hostname_matches, resolve_url
 from bot.services.providers.instagram import _meta_content
 
@@ -19,7 +19,7 @@ def is_reddit_url(url: str) -> bool:
     return hostname_matches(url, REDDIT_DOMAINS)
 
 
-def extract_proxy_media(url: str) -> dict | None:
+def extract_proxy_media(url: str) -> MediaResult | None:
     """Fallback extraction through vxreddit when yt-dlp cannot read a post."""
     resolved = resolve_url(url, REDDIT_SHORT_DOMAINS)
     parsed = urllib.parse.urlsplit(resolved)
@@ -43,8 +43,20 @@ def extract_proxy_media(url: str) -> dict | None:
                     media_url = video_url or source.get("u")
                     if not media_url:
                         return None
-                    items.append({"type": "video" if video_url else "photo", "url": html_module.unescape(media_url)})
-                return media_result(items, post.get("title", "Reddit Media"))
+                    items.append(
+                        MediaItem(
+                            "video" if video_url else "photo",
+                            url,
+                            direct_url=html_module.unescape(media_url),
+                            source_index=len(items) + 1,
+                        )
+                    )
+                return media_result(
+                    items,
+                    post.get("title", "Reddit Media"),
+                    source_url=url,
+                    provider="reddit",
+                )
         except (ValueError, KeyError, IndexError, TypeError, OSError) as exc:
             logger.debug("Reddit structured metadata unavailable: %s", exc)
         if "/gallery/" in parsed.path:
@@ -74,7 +86,16 @@ def extract_proxy_media(url: str) -> dict | None:
 
     video_match = re.search(r'<meta property="og:video" content="([^"]+)"', page)
     if video_match:
-        return {"type": "video", "url": html_module.unescape(video_match.group(1)), "title": title}
+        return media_result(
+            [MediaItem(
+                "video",
+                url,
+                direct_url=html_module.unescape(video_match.group(1)),
+            )],
+            title,
+            source_url=url,
+            provider="reddit",
+        )
 
     if (_meta_content(page, "og:type") or "").startswith("video"):
         return None
@@ -85,4 +106,9 @@ def extract_proxy_media(url: str) -> dict | None:
     nested_url = urllib.parse.parse_qs(urllib.parse.urlsplit(image_url).query).get("url")
     if nested_url:
         image_url = nested_url[0]
-    return {"type": "photo", "url": image_url, "title": title}
+    return media_result(
+        [MediaItem("photo", url, direct_url=image_url)],
+        title,
+        source_url=url,
+        provider="reddit",
+    )

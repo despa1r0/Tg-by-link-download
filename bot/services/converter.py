@@ -95,9 +95,20 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
 
     async with _FFMPEG_SEMAPHORE:
         context = contextvars.copy_context()
-        return await asyncio.get_running_loop().run_in_executor(
+        operation = asyncio.get_running_loop().run_in_executor(
             None, context.run, _convert
         )
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # FFmpeg runs in a worker thread. Wait for the thread before cleanup
+            # so it cannot recreate an operation-owned file after cancellation.
+            try:
+                await operation
+            finally:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            raise
 
 
 def _timestamp_to_seconds(value: str) -> int | float:

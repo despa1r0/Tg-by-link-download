@@ -1,15 +1,20 @@
-// Collect only the bot container's stdout/stderr JSON logs.
+// Collect both independent bot services' stdout/stderr JSON logs.
 discovery.docker "containers" {
   host = "unix:///var/run/docker.sock"
 }
 
-discovery.relabel "bot" {
+discovery.relabel "bots" {
   targets = discovery.docker.containers.targets
 
   rule {
     source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    regex         = "bot"
+    regex         = "(bot|discord)"
     action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "platform"
   }
 
   rule {
@@ -19,20 +24,22 @@ discovery.relabel "bot" {
   }
 }
 
-loki.source.docker "bot" {
+loki.source.docker "bots" {
   host       = "unix:///var/run/docker.sock"
-  targets    = discovery.relabel.bot.output
+  targets    = discovery.relabel.bots.output
   labels     = { service_name = "tg-media-bot", environment = "production" }
-  forward_to = [loki.process.bot.receiver]
+  forward_to = [loki.process.bots.receiver]
 }
 
-loki.process "bot" {
+loki.process "bots" {
   stage.json {
     expressions = {
       timestamp       = "",
       level           = "",
       event           = "",
+      platform        = "",
       source_platform = "",
+      provider        = "",
       request_id      = "",
       download_stage  = "",
       media_type      = "",
@@ -53,6 +60,7 @@ loki.process "bot" {
     values = {
       level           = "",
       event           = "",
+      platform        = "",
       source_platform = "",
     }
   }
@@ -63,6 +71,7 @@ loki.process "bot" {
       request_id      = "",
       download_stage  = "",
       media_type      = "",
+      provider        = "",
       error_type      = "",
       source_host     = "",
       source_url_hash = "",

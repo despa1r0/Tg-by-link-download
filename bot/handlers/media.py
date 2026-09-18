@@ -25,13 +25,8 @@ from bot.config import DOWNLOADS_DIR
 from bot.observability import log_context, log_media_failure, request_context
 from bot.services.converter import convert_to_gif
 from bot.services.downloader import (
-    download_detected_photo,
     download_media,
-    download_tiktok_photos,
-    download_twitter_media,
     extract_info,
-    get_gallery_count,
-    is_gallery,
 )
 from bot.services.providers.common import file_media_type
 from bot.services.providers.instagram import is_instagram_url
@@ -49,12 +44,6 @@ class BotStates(StatesGroup):
 
 CacheKey = tuple[int, int]
 url_cache: dict[CacheKey, str] = {}
-# Stores photo URLs when a gallery is detected (TikTok or Twitter)
-gallery_cache: dict[CacheKey, list[str]] = {}
-# Stores the source platform for gallery downloads ('tiktok' or 'twitter')
-gallery_source_cache: dict[CacheKey, str] = {}
-# Stores the resolved CDN URL so a photo click does not call the proxy twice.
-photo_url_cache: dict[CacheKey, str] = {}
 # Keeps only compact provider results needed by the eventual download action.
 media_info_cache: dict[CacheKey, dict] = {}
 cache_expiry: dict[CacheKey, float] = {}
@@ -110,9 +99,6 @@ def _report_failure(
 
 def _drop_cache(cache_key: CacheKey) -> None:
     url_cache.pop(cache_key, None)
-    gallery_cache.pop(cache_key, None)
-    gallery_source_cache.pop(cache_key, None)
-    photo_url_cache.pop(cache_key, None)
     media_info_cache.pop(cache_key, None)
     cache_expiry.pop(cache_key, None)
 
@@ -129,9 +115,6 @@ def _compact_media_info(info: dict | None) -> dict:
         return {}
     reusable_keys = (
         "_media",
-        "_twitter_media",
-        "_instagram_media",
-        "_reddit_media",
         "_download_url",
     )
     return {key: info[key] for key in reusable_keys if key in info}
@@ -320,7 +303,6 @@ async def process_gallery_selection(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Session expired. Please send the link again.")
         return
-    photo_urls = gallery_cache.get(cache_id, [])
     media_info = media_info_cache.get(cache_id)
     await state.clear()
 
@@ -355,39 +337,24 @@ async def process_gallery_selection(message: Message, state: FSMContext):
             # Re-enter the state so they can try again
             await state.update_data(url=url, gallery_count=total, gallery_cache_id=cache_id)
             await state.set_state(BotStates.waiting_for_gallery_selection)
-            if cache_id:
-                gallery_cache[cache_id] = photo_urls
             return
         indices = sorted(set(nums))
 
     status_msg = await message.answer("Downloading selected media… ⏳")
 
-    # Use the appropriate downloader based on the cached source
-    source = gallery_source_cache.get(cache_id, '') if cache_id else ''
-    if photo_urls and source == 'twitter':
-        files = await _run_observed(
-            message, url, "download_gallery", "gallery",
-            download_twitter_media(photo_urls, indices),
-        )
-    elif photo_urls:
-        files = await _run_observed(
-            message, url, "download_gallery", "gallery",
-            download_tiktok_photos(photo_urls, indices),
-        )
-    else:
-        playlist_items = ",".join(str(n) for n in indices) if indices else None
-        files = await _run_observed(
-            message,
+    playlist_items = ",".join(str(n) for n in indices) if indices else None
+    files = await _run_observed(
+        message,
+        url,
+        "download_gallery",
+        "gallery",
+        download_media(
             url,
-            "download_gallery",
             "gallery",
-            download_media(
-                url,
-                "gallery",
-                playlist_items=playlist_items,
-                media_info=media_info,
-            ),
-        )
+            playlist_items=playlist_items,
+            media_info=media_info,
+        ),
+    )
 
     # Clean up gallery cache
     if cache_id:
@@ -441,18 +408,10 @@ async def handle_link(message: Message, state: FSMContext):
             await msg.edit_text("Could not analyze this link. It may be private or unsupported.")
         return
 
-    # Shared photo/album controls reuse the ordered metadata during download.
+    # Every provider now exposes the same ordered result. Keep Twitter's
+    # established one-click photo/GIF behavior while sharing the download path.
     detected = info.get("_media")
-    if detected and detected["type"] == "photo":
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Download Photo", callback_data="dl_photo")],
-            [InlineKeyboardButton(text="Cancel", callback_data="dl_cancel")],
-        ])
-        await msg.edit_text("Photo detected! Choose an action:", reply_markup=keyboard)
-        cache_id = _cache_key(msg)
-        _store_cache(cache_id, text, info)
-        photo_url_cache[cache_id] = detected["items"][0]["url"]
-        return
+    is_twitter = str(info.get("extractor_key") or "").lower() == "twitter"
     if detected and len(detected["items"]) > 1:
         count = len(detected["items"])
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -463,138 +422,54 @@ async def handle_link(message: Message, state: FSMContext):
         await msg.edit_text(f"Media album: {count} items. Choose an action:", reply_markup=keyboard)
         _store_cache(_cache_key(msg), text, info)
         return
+
+    if detected and is_twitter and detected["type"] in {"photo", "gif"}:
+        kind = detected["type"]
+        await msg.edit_text(
+            "🎞 GIF detected! Downloading… ⏳"
+            if kind == "gif"
+            else "📷 Photo detected! Downloading… ⏳"
+        )
+        files = await _run_observed(
+            message,
+            text,
+            "download_media",
+            kind,
+            download_media(text, "video" if kind == "gif" else "photo", media_info=info),
+        )
+        filepath = files[0] if files else None
+        if not filepath:
+            await msg.edit_text(f"Failed to download {kind}.")
+            return
+        try:
+            if kind == "gif":
+                await message.answer_animation(FSInputFile(filepath))
+            else:
+                await _send_file(message, filepath)
+            await msg.edit_text("Done! ✅")
+        except Exception as exc:
+            _report_failure(message, text, "send_to_telegram", kind, exc)
+            await msg.edit_text(f"Failed to send {kind}. It might be too large.")
+        finally:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        return
+
+    if detected and detected["type"] == "photo":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Download Photo", callback_data="dl_photo")],
+            [InlineKeyboardButton(text="Cancel", callback_data="dl_cancel")],
+        ])
+        await msg.edit_text("Photo detected! Choose an action:", reply_markup=keyboard)
+        cache_id = _cache_key(msg)
+        _store_cache(cache_id, text, info)
+        return
     if info.get("entries") is not None and not detected:
         await msg.edit_text("Please send a link to a single post or video, rather than a playlist.")
         return
 
-    twitter_media = info.get('_twitter_media') if info else None
-    if twitter_media:
-        tw_type = twitter_media.get('type')
-        tw_urls = twitter_media.get('urls', [])
-        # GIF — auto-download and send as animation
-        if tw_type == 'gif' and tw_urls:
-            await msg.edit_text("🎞 GIF detected! Downloading… ⏳")
-            files = await _run_observed(
-                message, text, "download_media", "gif", download_twitter_media(tw_urls)
-            )
-            filepath = files[0] if files else None
-            if not filepath:
-                await msg.edit_text("Failed to download GIF.")
-                return
-            try:
-                await message.answer_animation(FSInputFile(filepath))
-                await msg.edit_text("Done! ✅")
-            except Exception as e:
-                _report_failure(message, text, "send_to_telegram", "gif", e)
-                await msg.edit_text("Failed to send GIF. It might be too large.")
-            finally:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-            return
-
-        # Single photo — auto-download and send
-        if tw_type == 'photo' and tw_urls:
-            await msg.edit_text("📷 Photo detected! Downloading… ⏳")
-            files = await _run_observed(
-                message, text, "download_media", "photo", download_twitter_media(tw_urls)
-            )
-            filepath = files[0] if files else None
-            if not filepath:
-                await msg.edit_text("Failed to download photo.")
-                return
-            try:
-                await _send_file(message, filepath)
-                await msg.edit_text("Done! ✅")
-            except Exception as e:
-                _report_failure(message, text, "send_to_telegram", "photo", e)
-                await msg.edit_text("Failed to send photo.")
-            finally:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-            return
-
-        # Multiple photos — gallery selection flow
-        if tw_type == 'photos' and tw_urls:
-            count = len(tw_urls)
-            cache_id = _cache_key(msg)
-            gallery_cache[cache_id] = tw_urls
-            gallery_source_cache[cache_id] = 'twitter'
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📸 Download All Photos", callback_data="dl_gallery_all")],
-                [InlineKeyboardButton(text="🔢 Pick Specific Photos", callback_data="dl_gallery_pick")],
-                [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
-            ])
-            await msg.edit_text(
-                f"📷 Twitter photo gallery — **{count}** photos!\nChoose an action:",
-                reply_markup=keyboard,
-                parse_mode="Markdown",
-            )
-            _store_cache(cache_id, text)
-            await state.update_data(gallery_count=count, gallery_cache_id=list(cache_id))
-            return
-
-        # Twitter video — show normal video menu
-        if tw_type == 'video':
-            duration = twitter_media.get('duration')
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎥 Download Video", callback_data="dl_video")],
-                [InlineKeyboardButton(text="🎵 Download Audio", callback_data="dl_audio")],
-                [InlineKeyboardButton(text="🎞 Convert to GIF", callback_data="dl_gif")],
-                [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
-            ])
-            await msg.edit_text("🐦 Twitter video detected! Choose an action:", reply_markup=keyboard)
-            _store_cache(_cache_key(msg), text, info)
-            if duration:
-                await state.update_data(video_duration=duration)
-            return
-
-    # ── Instagram/Reddit photo ──
-    detected_media = info.get('_instagram_media') or info.get('_reddit_media')
-    if detected_media and detected_media.get('type') in {'photo', 'image'}:
-        platform = info.get('extractor_key', 'Social media')
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📷 Download Photo", callback_data="dl_photo")],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
-        ])
-        await msg.edit_text(
-            f"📷 {platform} photo detected! Choose an action:",
-            reply_markup=keyboard,
-        )
-        cache_id = _cache_key(msg)
-        _store_cache(cache_id, text)
-        photo_url_cache[cache_id] = detected_media['url']
-        return
-
-    if info and is_gallery(info):
-        count = get_gallery_count(info)
-
-        # Cache photo URLs for later download (TikTok)
-        cache_id = _cache_key(msg)
-        tiktok_photos = info.get('_tiktok_photos')
-        if tiktok_photos:
-            gallery_cache[cache_id] = tiktok_photos
-            gallery_source_cache[cache_id] = 'tiktok'
-
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📸 Download All Photos", callback_data="dl_gallery_all")],
-            [InlineKeyboardButton(text="🔢 Pick Specific Photos", callback_data="dl_gallery_pick")],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="dl_cancel")],
-        ])
-        await msg.edit_text(
-            f"📷 Photo gallery detected — **{count}** photos!\nChoose an action:",
-            reply_markup=keyboard,
-            parse_mode="Markdown",
-        )
-        _store_cache(cache_id, text)
-        await state.update_data(
-            gallery_count=count,
-            gallery_cache_id=list(cache_id),
-        )
-        return
-
     # Store video duration for later (GIF auto-convert for short videos)
-    duration = info.get('duration') if info else None
+    duration = detected.get("duration") if detected else info.get("duration")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎥 Download Video", callback_data="dl_video")],
@@ -682,8 +557,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
     if action == "gallery":
         sub_action = parts[2] if len(parts) > 2 else "all"
         cache_id = cache_key
-        photo_urls = gallery_cache.get(cache_id, [])
-        count = len((media_info or {}).get("_media", {}).get("items", [])) or len(photo_urls)
+        count = len((media_info or {}).get("_media", {}).get("items", []))
 
         if sub_action == "pick":
             await state.update_data(url=url, gallery_count=count, gallery_cache_id=list(cache_id))
@@ -696,28 +570,15 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             )
             return
 
-        # sub_action == "all" — download all photos
+        # sub_action == "all" — download all ordered media
         await callback.message.edit_text("Downloading all media… ⏳")
-
-        source = gallery_source_cache.get(cache_id, '') if cache_id else ''
-        if photo_urls and source == 'twitter':
-            files = await _run_observed(
-                callback, url, "download_gallery", "gallery",
-                download_twitter_media(photo_urls),
-            )
-        elif photo_urls:
-            files = await _run_observed(
-                callback, url, "download_gallery", "gallery",
-                download_tiktok_photos(photo_urls),
-            )
-        else:
-            files = await _run_observed(
-                callback,
-                url,
-                "download_gallery",
-                "gallery",
-                download_media(url, "gallery", media_info=media_info),
-            )
+        files = await _run_observed(
+            callback,
+            url,
+            "download_gallery",
+            "gallery",
+            download_media(url, "gallery", media_info=media_info),
+        )
 
         # Clean up
         await state.clear()
@@ -814,7 +675,7 @@ async def handle_dl_callback(callback: CallbackQuery, state: FSMContext):
             url,
             "download_media",
             "photo",
-            download_detected_photo(photo_url_cache.get(cache_key, "")),
+            download_media(url, "photo", media_info=media_info),
         )
         filepath = files[0] if files else None
 
