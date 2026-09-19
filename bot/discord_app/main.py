@@ -19,7 +19,11 @@ from bot.observability import (
     log_media_failure,
     request_context,
 )
-from bot.services.converter import convert_to_discord_gif
+from bot.services.converter import (
+    GifUploadLimitExceeded,
+    convert_to_discord_gif,
+    parse_gif_range,
+)
 from bot.services.downloader import cleanup_files, download_media, extract_info
 from bot.services.media_model import MediaItem, media_result
 
@@ -78,7 +82,7 @@ class MediaActionView(discord.ui.View):
         item_count = len(result["items"])
 
         if attachment:
-            self._add_button("Convert to GIF (first 10s)", discord.ButtonStyle.primary, self._convert_gif)
+            self._add_button("Convert to GIF", discord.ButtonStyle.primary, self._convert_gif)
         elif item_count > 1:
             self._add_button("Download all", discord.ButtonStyle.primary, self._download_all)
             # Discord selects allow 25 options and a view has five component rows.
@@ -123,7 +127,7 @@ class MediaActionView(discord.ui.View):
         else:
             self._add_button("Download video", discord.ButtonStyle.primary, self._download_video)
             self._add_button("Extract audio", discord.ButtonStyle.secondary, self._download_audio)
-            self._add_button("Convert to GIF (first 10s)", discord.ButtonStyle.secondary, self._convert_gif)
+            self._add_button("Convert to GIF", discord.ButtonStyle.secondary, self._convert_gif)
         self.cancel_button = self._add_button(
             "Cancel", discord.ButtonStyle.danger, self._cancel
         )
@@ -168,7 +172,12 @@ class MediaActionView(discord.ui.View):
         await self._deliver(interaction, "audio")
 
     async def _convert_gif(self, interaction: discord.Interaction) -> None:
-        await self._deliver(interaction, "gif")
+        if self.is_finished() or self.active_task:
+            await interaction.response.send_message(
+                "This operation is already running or has expired.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(GifRangeModal(self))
 
     async def _cancel(self, interaction: discord.Interaction) -> None:
         task = self.active_task
@@ -183,7 +192,18 @@ class MediaActionView(discord.ui.View):
         interaction: discord.Interaction,
         action: str,
         indices: list[int] | None = None,
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        acknowledged: bool = False,
     ) -> None:
+        if self.is_finished() or self.active_task:
+            message = "This operation is already running or has expired."
+            if acknowledged:
+                await self._notify(interaction, message)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
         files: list[str] = []
         context = request_context(interaction, self.url, platform="discord")
         context["provider"] = self.info["_media"].get("provider") or context["provider"]
@@ -195,7 +215,10 @@ class MediaActionView(discord.ui.View):
             try:
                 self._disable(keep_cancel=True)
                 self.active_task = asyncio.current_task()
-                await interaction.response.edit_message(content="Processing media…", view=self)
+                if acknowledged:
+                    await self.message.edit(content="Processing media…", view=self)
+                else:
+                    await interaction.response.edit_message(content="Processing media…", view=self)
                 selection = ",".join(str(index) for index in indices) if indices else None
                 download_action = "video" if action == "gif" else action
                 files = await download_media(
@@ -206,9 +229,11 @@ class MediaActionView(discord.ui.View):
                 )
                 if action == "gif" and files:
                     source_path = files[0]
-                    duration = self.info["_media"].get("duration") or 10
                     animation = await convert_to_discord_gif(
-                        source_path, "0", str(min(float(duration), 10))
+                        source_path,
+                        start_time,
+                        end_time,
+                        max_output_bytes=self._upload_limit(interaction),
                     )
                     cleanup_files(files)
                     files = [animation] if animation else []
@@ -228,6 +253,13 @@ class MediaActionView(discord.ui.View):
             except asyncio.CancelledError:
                 # The cancel interaction has already updated the shared message.
                 return
+            except GifUploadLimitExceeded:
+                limit_mb = self._upload_limit(interaction) / (1024 * 1024)
+                await self._notify(
+                    interaction,
+                    f"The GIF exceeds this channel's upload limit ({limit_mb:g} MB). Try a shorter range.",
+                )
+                await self._finish(interaction, "Upload limit exceeded.")
             except Exception as exc:
                 log_media_failure(
                     logger,
@@ -253,7 +285,8 @@ class MediaActionView(discord.ui.View):
         self._disable()
         self.stop()
         try:
-            await interaction.message.edit(content=content, view=self)
+            message = self.message or interaction.message
+            await message.edit(content=content, view=self)
         except discord.HTTPException:
             pass
 
@@ -272,8 +305,7 @@ class MediaActionView(discord.ui.View):
     async def _send_files(
         self, interaction: discord.Interaction, paths: list[str]
     ) -> bool:
-        guild_limit = getattr(interaction.guild, "filesize_limit", None)
-        byte_limit = guild_limit or self.settings.fallback_upload_bytes
+        byte_limit = self._upload_limit(interaction)
         oversized = [path for path in paths if os.path.getsize(path) > byte_limit]
         if oversized:
             limit_mb = byte_limit / (1024 * 1024)
@@ -299,6 +331,57 @@ class MediaActionView(discord.ui.View):
                 ]
                 await interaction.channel.send(files=attachments)
         return True
+
+    def _upload_limit(self, interaction: discord.Interaction) -> int:
+        guild_limit = getattr(getattr(interaction, "guild", None), "filesize_limit", None)
+        return guild_limit or self.settings.fallback_upload_bytes
+
+
+class GifRangeModal(discord.ui.Modal, title="Convert video to GIF"):
+    def __init__(self, view: MediaActionView) -> None:
+        super().__init__()
+        self.media_view = view
+        self.time_range = discord.ui.TextInput(
+            label="Time range (START-END)",
+            placeholder="00:15-00:25 or 1-6",
+            default="0-10",
+            max_length=64,
+        )
+        self.add_item(self.time_range)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.media_view.owner_id:
+            await interaction.response.send_message(
+                "Only the user who submitted this link can use these controls.", ephemeral=True
+            )
+            return
+        if self.media_view.is_finished() or self.media_view.active_task:
+            await interaction.response.send_message(
+                "This operation is already running or has expired.", ephemeral=True
+            )
+            return
+        try:
+            start_time, end_time, start_seconds, end_seconds = parse_gif_range(
+                self.time_range.value
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        if end_seconds - start_seconds > 10:
+            await self.media_view._notify(
+                interaction,
+                "⚠️ A longer animation may take more time, lose some quality, or exceed "
+                "Discord's file-size limit. I will still convert the full range.",
+            )
+        await self.media_view._deliver(
+            interaction,
+            "gif",
+            start_time=start_time,
+            end_time=end_time,
+            acknowledged=True,
+        )
 
 
 def _is_dm(channel: discord.abc.Messageable) -> bool:

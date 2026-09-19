@@ -7,7 +7,8 @@ import discord
 
 from bot.config import MAX_DOWNLOAD_BYTES
 from bot.discord_app.config import DiscordSettings
-from bot.discord_app.main import MediaActionView, create_client
+from bot.discord_app.main import GifRangeModal, MediaActionView, create_client
+from bot.services.converter import GifUploadLimitExceeded
 from bot.services.media_model import MediaItem, media_result
 
 
@@ -131,7 +132,7 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
     @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
-    async def test_attachment_conversion_sends_real_gif(self, download, convert):
+    async def test_attachment_conversion_accepts_long_range_and_warns(self, download, convert):
         url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
         result = media_result([MediaItem("video", url, direct_url=url)])
         view = MediaActionView(
@@ -139,19 +140,107 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             settings=_settings(), attachment=True,
         )
         view._send_files = AsyncMock(return_value=True)
+        view.message = SimpleNamespace(edit=AsyncMock())
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=10),
-            message=SimpleNamespace(edit=AsyncMock()),
-            response=SimpleNamespace(edit_message=AsyncMock()),
+            guild=None,
+            response=SimpleNamespace(send_modal=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
         )
         download.return_value = ["clip.mp4"]
         convert.return_value = "clip.gif"
 
         with patch("bot.discord_app.main.cleanup_files"):
             await view._convert_gif(interaction)
+            modal = interaction.response.send_modal.await_args.args[0]
+            self.assertIsInstance(modal, GifRangeModal)
+            modal.time_range._value = "00:15-00:40"
+            await modal.on_submit(interaction)
 
-        convert.assert_awaited_once_with("clip.mp4", "0", "10.0")
+        interaction.response.defer.assert_awaited_once_with()
+        self.assertIn("longer animation", interaction.followup.send.await_args.args[0])
+        convert.assert_awaited_once_with(
+            "clip.mp4", "00:15", "00:40", max_output_bytes=10 * 1024 * 1024
+        )
         view._send_files.assert_awaited_once_with(interaction, ["clip.gif"])
+        self.assertEqual(view.message.edit.await_args.kwargs["content"], "Done.")
+
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_short_gif_range_uses_guild_limit_without_warning(self, download, convert):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        result = media_result([MediaItem("video", url, direct_url=url)])
+        view = MediaActionView(
+            owner_id=10, url=url, info={"_media": result},
+            settings=_settings(), attachment=True,
+        )
+        view.message = SimpleNamespace(edit=AsyncMock())
+        view._send_files = AsyncMock(return_value=True)
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10),
+            guild=SimpleNamespace(filesize_limit=25 * 1024 * 1024),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        modal = GifRangeModal(view)
+        modal.time_range._value = "1-9"
+        download.return_value = ["clip.mp4"]
+        convert.return_value = "clip.gif"
+
+        with patch("bot.discord_app.main.cleanup_files"):
+            await modal.on_submit(interaction)
+
+        interaction.followup.send.assert_not_awaited()
+        convert.assert_awaited_once_with(
+            "clip.mp4", "1", "9", max_output_bytes=25 * 1024 * 1024
+        )
+
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_invalid_gif_range_does_not_download(self, download):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        result = media_result([MediaItem("video", url, direct_url=url)])
+        view = MediaActionView(
+            owner_id=10, url=url, info={"_media": result},
+            settings=_settings(), attachment=True,
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        modal = GifRangeModal(view)
+        modal.time_range._value = "20-10"
+
+        await modal.on_submit(interaction)
+
+        self.assertIn("End time", interaction.response.send_message.await_args.args[0])
+        download.assert_not_awaited()
+        self.assertFalse(view.is_finished())
+
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_gif_over_upload_limit_reports_error(self, download, convert):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        result = media_result([MediaItem("video", url, direct_url=url)])
+        view = MediaActionView(
+            owner_id=10, url=url, info={"_media": result},
+            settings=_settings(), attachment=True,
+        )
+        view.message = SimpleNamespace(edit=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10), guild=None,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        modal = GifRangeModal(view)
+        modal.time_range._value = "0-20"
+        download.return_value = ["clip.mp4"]
+        convert.side_effect = GifUploadLimitExceeded
+
+        with patch("bot.discord_app.main.cleanup_files"):
+            await modal.on_submit(interaction)
+
+        self.assertIn("10 MB", interaction.followup.send.await_args.args[0])
+        self.assertEqual(view.message.edit.await_args.kwargs["content"], "Upload limit exceeded.")
 
     @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
     async def test_download_button_finishes_instead_of_leaving_processing_status(self, download):

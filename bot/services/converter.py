@@ -3,14 +3,32 @@ import contextvars
 import logging
 import math
 import os
+import re
 import uuid
 
 import ffmpeg
 
-from bot.config import DOWNLOADS_DIR, FFMPEG_CONCURRENCY, MAX_DOWNLOAD_BYTES
+from bot.config import DOWNLOADS_DIR, FFMPEG_CONCURRENCY
 
 logger = logging.getLogger(__name__)
 _FFMPEG_SEMAPHORE = asyncio.Semaphore(FFMPEG_CONCURRENCY)
+
+
+class GifUploadLimitExceeded(Exception):
+    """The converted GIF cannot fit in the destination's upload limit."""
+
+
+def parse_gif_range(value: str) -> tuple[str, str, int | float, int | float]:
+    """Parse the same START-END timestamp format accepted by the Telegram bot."""
+    match = re.fullmatch(r"(\d+(?::\d+){0,2})\s*-\s*(\d+(?::\d+){0,2})", value.strip())
+    if not match:
+        raise ValueError("Invalid format. Use START-END (for example 00:15-00:25 or 1-6).")
+    start_time, end_time = match.groups()
+    start_seconds = _timestamp_to_seconds(start_time)
+    end_seconds = _timestamp_to_seconds(end_time)
+    if end_seconds <= start_seconds:
+        raise ValueError("End time must be after start time.")
+    return start_time, end_time, start_seconds, end_seconds
 
 
 async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str | None:
@@ -112,9 +130,9 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
 
 
 async def convert_to_discord_gif(
-    input_path: str, start_time: str, end_time: str
+    input_path: str, start_time: str, end_time: str, *, max_output_bytes: int | None = None
 ) -> str | None:
-    """Create a bounded, looping GIF rather than Telegram's MP4 animation."""
+    """Create a looping GIF, stopping when its destination upload limit is reached."""
     if not os.path.exists(input_path):
         return None
 
@@ -124,7 +142,7 @@ async def convert_to_discord_gif(
     except ValueError:
         return None
     duration = end_seconds - start_seconds
-    if duration <= 0 or duration > 10:
+    if duration <= 0 or start_seconds < 0:
         return None
 
     output_path = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.gif")
@@ -145,11 +163,18 @@ async def convert_to_discord_gif(
             split = frames.split()
             palette = split[0].filter("palettegen")
             gif = ffmpeg.filter([split[1], palette], "paletteuse")
-            ffmpeg.output(gif, output_path, loop=0).overwrite_output().run(quiet=True)
-            if os.path.exists(output_path) and 0 < os.path.getsize(output_path) <= MAX_DOWNLOAD_BYTES:
-                result = output_path
-            else:
-                logger.warning("Discord GIF is empty or exceeds the configured size limit")
+            output_options = {"loop": 0}
+            if max_output_bytes is not None:
+                output_options["fs"] = max_output_bytes
+            ffmpeg.output(gif, output_path, **output_options).overwrite_output().run(quiet=True)
+            if os.path.exists(output_path):
+                output_size = os.path.getsize(output_path)
+                if max_output_bytes is not None and output_size >= max_output_bytes:
+                    raise GifUploadLimitExceeded
+                if output_size > 0:
+                    result = output_path
+        except GifUploadLimitExceeded:
+            raise
         except ffmpeg.Error as exc:
             stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else "unknown"
             logger.error("FFmpeg GIF conversion failed: %s", stderr)

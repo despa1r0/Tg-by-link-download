@@ -73,9 +73,11 @@ A detailed Russian walkthrough is available in
    value disables all guild-channel processing. Set `DISCORD_ALLOW_DMS=false`
    to disable DMs; it defaults to `true`.
 4. Send a supported link (including a forwarded message) in an allowed channel
-   or DM. Uploaded or forwarded video files offer a first-ten-seconds GIF
-   conversion. Only the sender can use the resulting controls. Album selects
-   preserve source order; downloads are split into configured attachment
+   or DM. Uploaded or forwarded video files offer GIF conversion with a
+   user-selected `START-END` range (seconds, `MM:SS`, or `HH:MM:SS`). Ranges
+   over ten seconds display a warning, and an oversized result is rejected
+   with the upload limit shown. Only the sender can use the resulting controls.
+   Album selects preserve source order; downloads are split into configured attachment
    batches. Cancel remains available during a long operation, and temporary
    files are removed after success, failure, or cancellation.
 
