@@ -156,6 +156,63 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
     @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_short_known_video_converts_full_length_without_modal(self, download, convert):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        download.return_value = ["clip.mp4"]
+        convert.return_value = "clip.gif"
+        for duration in (7.533, 10, 12.5, 14.999):
+            with self.subTest(duration=duration):
+                result = media_result([
+                    MediaItem("video", url, direct_url=url, duration=duration)
+                ])
+                view = MediaActionView(
+                    owner_id=10, url=url, info={"_media": result},
+                    settings=_settings(), attachment=True,
+                )
+                self.assertEqual(view.children[0].label, "Convert full video to GIF")
+                view.message = SimpleNamespace(edit=AsyncMock())
+                view._send_files = AsyncMock(return_value=True)
+                interaction = SimpleNamespace(
+                    user=SimpleNamespace(id=10), guild=None,
+                    response=SimpleNamespace(edit_message=AsyncMock(), send_modal=AsyncMock()),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                )
+
+                with patch("bot.discord_app.main.cleanup_files"):
+                    await view._convert_gif(interaction)
+
+                interaction.response.send_modal.assert_not_awaited()
+                interaction.response.edit_message.assert_awaited_once()
+                convert.assert_awaited_with(
+                    "clip.mp4", "0", str(float(duration)), max_output_bytes=10 * 1024 * 1024
+                )
+                if duration > 10:
+                    self.assertIn("longer animation", interaction.followup.send.await_args.args[0])
+                else:
+                    interaction.followup.send.assert_not_awaited()
+                self.assertEqual(view.message.edit.await_args.kwargs["content"], "Done.")
+
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_fifteen_second_video_keeps_manual_range(self, download):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        result = media_result([MediaItem("video", url, direct_url=url, duration=15)])
+        view = MediaActionView(
+            owner_id=10, url=url, info={"_media": result},
+            settings=_settings(), attachment=True,
+        )
+        self.assertEqual(view.children[0].label, "Convert to GIF")
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10),
+            response=SimpleNamespace(send_modal=AsyncMock()),
+        )
+
+        await view._convert_gif(interaction)
+
+        self.assertIsInstance(interaction.response.send_modal.await_args.args[0], GifRangeModal)
+        download.assert_not_awaited()
+
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
     async def test_attachment_conversion_accepts_long_range_and_warns(self, download, convert):
         url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
         result = media_result([MediaItem("video", url, direct_url=url)])

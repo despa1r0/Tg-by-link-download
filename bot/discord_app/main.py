@@ -101,9 +101,14 @@ class MediaActionView(discord.ui.View):
         self.active_task: asyncio.Task | None = None
         result = info["_media"]
         item_count = len(result["items"])
+        duration = _known_video_duration(result)
+        gif_label = (
+            "Convert full video to GIF"
+            if duration is not None and duration < 15 else "Convert to GIF"
+        )
 
         if attachment:
-            self._add_button("Convert to GIF", discord.ButtonStyle.primary, self._convert_gif)
+            self._add_button(gif_label, discord.ButtonStyle.primary, self._convert_gif)
         elif item_count > 1:
             self._add_button("Download all", discord.ButtonStyle.primary, self._download_all)
             # Discord selects allow 25 options and a view has five component rows.
@@ -148,7 +153,7 @@ class MediaActionView(discord.ui.View):
         else:
             self._add_button("Download video", discord.ButtonStyle.primary, self._download_video)
             self._add_button("Extract audio", discord.ButtonStyle.secondary, self._download_audio)
-            self._add_button("Convert to GIF", discord.ButtonStyle.secondary, self._convert_gif)
+            self._add_button(gif_label, discord.ButtonStyle.secondary, self._convert_gif)
         self.cancel_button = self._add_button(
             "Cancel", discord.ButtonStyle.danger, self._cancel
         )
@@ -198,6 +203,16 @@ class MediaActionView(discord.ui.View):
                 "This operation is already running or has expired.", ephemeral=True
             )
             return
+        duration = _known_video_duration(self.info["_media"])
+        if duration is not None and duration < 15:
+            await self._deliver(
+                interaction,
+                "gif",
+                start_time="0",
+                end_time=str(duration),
+                warn_long_gif=duration > 10,
+            )
+            return
         await interaction.response.send_modal(GifRangeModal(self))
 
     async def _cancel(self, interaction: discord.Interaction) -> None:
@@ -217,6 +232,7 @@ class MediaActionView(discord.ui.View):
         start_time: str | None = None,
         end_time: str | None = None,
         acknowledged: bool = False,
+        warn_long_gif: bool = False,
     ) -> None:
         if self.is_finished() or self.active_task:
             message = "This operation is already running or has expired."
@@ -240,6 +256,12 @@ class MediaActionView(discord.ui.View):
                     await self.message.edit(content="Processing media…", view=self)
                 else:
                     await interaction.response.edit_message(content="Processing media…", view=self)
+                if warn_long_gif:
+                    await self._notify(
+                        interaction,
+                        "⚠️ A longer animation may take more time, lose some quality, or exceed "
+                        "Discord's file-size limit. I will still convert the full range.",
+                    )
                 selection = ",".join(str(index) for index in indices) if indices else None
                 download_action = "video" if action == "gif" else action
                 files = await download_media(
@@ -417,18 +439,13 @@ class GifRangeModal(discord.ui.Modal, title="Convert video to GIF"):
             return
 
         await interaction.response.defer()
-        if end_seconds - start_seconds > 10:
-            await self.media_view._notify(
-                interaction,
-                "⚠️ A longer animation may take more time, lose some quality, or exceed "
-                "Discord's file-size limit. I will still convert the full range.",
-            )
         await self.media_view._deliver(
             interaction,
             "gif",
             start_time=start_time,
             end_time=end_time,
             acknowledged=True,
+            warn_long_gif=end_seconds - start_seconds > 10,
         )
 
 
