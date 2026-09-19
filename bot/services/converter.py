@@ -7,7 +7,7 @@ import uuid
 
 import ffmpeg
 
-from bot.config import DOWNLOADS_DIR, FFMPEG_CONCURRENCY
+from bot.config import DOWNLOADS_DIR, FFMPEG_CONCURRENCY, MAX_DOWNLOAD_BYTES
 
 logger = logging.getLogger(__name__)
 _FFMPEG_SEMAPHORE = asyncio.Semaphore(FFMPEG_CONCURRENCY)
@@ -103,6 +103,69 @@ async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str
         except asyncio.CancelledError:
             # FFmpeg runs in a worker thread. Wait for the thread before cleanup
             # so it cannot recreate an operation-owned file after cancellation.
+            try:
+                await operation
+            finally:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            raise
+
+
+async def convert_to_discord_gif(
+    input_path: str, start_time: str, end_time: str
+) -> str | None:
+    """Create a bounded, looping GIF rather than Telegram's MP4 animation."""
+    if not os.path.exists(input_path):
+        return None
+
+    try:
+        start_seconds = _timestamp_to_seconds(start_time)
+        end_seconds = _timestamp_to_seconds(end_time)
+    except ValueError:
+        return None
+    duration = end_seconds - start_seconds
+    if duration <= 0 or duration > 10:
+        return None
+
+    output_path = os.path.join(DOWNLOADS_DIR, f"{uuid.uuid4()}.gif")
+
+    def _convert() -> str | None:
+        result = None
+        try:
+            frames = (
+                ffmpeg.input(input_path, ss=start_seconds, t=duration)
+                .video.filter("fps", fps=10)
+                .filter(
+                    "scale",
+                    "if(gt(iw,ih),min(480,iw),-1)",
+                    "if(gt(iw,ih),-1,min(480,ih))",
+                    flags="lanczos",
+                )
+            )
+            split = frames.split()
+            palette = split[0].filter("palettegen")
+            gif = ffmpeg.filter([split[1], palette], "paletteuse")
+            ffmpeg.output(gif, output_path, loop=0).overwrite_output().run(quiet=True)
+            if os.path.exists(output_path) and 0 < os.path.getsize(output_path) <= MAX_DOWNLOAD_BYTES:
+                result = output_path
+            else:
+                logger.warning("Discord GIF is empty or exceeds the configured size limit")
+        except ffmpeg.Error as exc:
+            stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else "unknown"
+            logger.error("FFmpeg GIF conversion failed: %s", stderr)
+        except Exception as exc:
+            logger.error("Unexpected Discord GIF conversion error: %s", exc)
+        finally:
+            if result is None and os.path.exists(output_path):
+                os.remove(output_path)
+        return result
+
+    async with _FFMPEG_SEMAPHORE:
+        context = contextvars.copy_context()
+        operation = asyncio.get_running_loop().run_in_executor(None, context.run, _convert)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
             try:
                 await operation
             finally:

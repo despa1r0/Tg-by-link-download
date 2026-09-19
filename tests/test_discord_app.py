@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
+from bot.config import MAX_DOWNLOAD_BYTES
 from bot.discord_app.config import DiscordSettings
-from bot.discord_app.main import MediaActionView
+from bot.discord_app.main import MediaActionView, create_client
 from bot.services.media_model import MediaItem, media_result
 
 
@@ -21,6 +22,137 @@ def _settings() -> DiscordSettings:
 
 
 class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
+    def _message(self, *, content="", attachments=(), snapshots=()):
+        status = SimpleNamespace(edit=AsyncMock())
+        message = SimpleNamespace(
+            author=SimpleNamespace(bot=False, id=10),
+            channel=SimpleNamespace(id=20),
+            content=content,
+            attachments=list(attachments),
+            embeds=[],
+            message_snapshots=list(snapshots),
+            reply=AsyncMock(return_value=status),
+        )
+        return message, status
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    async def test_forwarded_message_link_is_analyzed(self, extract, _is_dm):
+        url = "https://x.com/user/status/1"
+        result = media_result([MediaItem("video", url, direct_url=url)])
+        extract.return_value = {"_media": result}
+        snapshot = SimpleNamespace(content=url, attachments=[], embeds=[])
+        message, status = self._message(snapshots=[snapshot])
+
+        await create_client(_settings()).on_message(message)
+
+        extract.assert_awaited_once_with(url)
+        self.assertIsInstance(status.edit.await_args.kwargs["view"], MediaActionView)
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    async def test_forwarded_link_takes_priority_over_outer_embed(self, extract, _is_dm):
+        url = "https://x.com/user/status/2"
+        extract.return_value = {
+            "_media": media_result([MediaItem("video", url, direct_url=url)])
+        }
+        snapshot = SimpleNamespace(content=url, attachments=[], embeds=[])
+        message, _status = self._message(snapshots=[snapshot])
+        message.embeds = [SimpleNamespace(url="https://discord.com/channels/1/2/3")]
+
+        await create_client(_settings()).on_message(message)
+
+        extract.assert_awaited_once_with(url)
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    async def test_forwarded_embed_link_is_analyzed(self, extract, _is_dm):
+        url = "https://x.com/user/status/3"
+        extract.return_value = {
+            "_media": media_result([MediaItem("video", url, direct_url=url)])
+        }
+        snapshot = SimpleNamespace(
+            content="", attachments=[], embeds=[SimpleNamespace(url=url)]
+        )
+        message, _status = self._message(snapshots=[snapshot])
+
+        await create_client(_settings()).on_message(message)
+
+        extract.assert_awaited_once_with(url)
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    async def test_video_attachment_offers_gif_conversion(self, extract, _is_dm):
+        attachment = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/1/2/clip.mp4",
+            filename="clip.mp4",
+            content_type="video/mp4",
+            size=1024,
+        )
+        message, _status = self._message(attachments=[attachment])
+
+        await create_client(_settings()).on_message(message)
+
+        extract.assert_not_awaited()
+        view = message.reply.await_args.kwargs["view"]
+        self.assertIsInstance(view, MediaActionView)
+        self.assertTrue(any("GIF" in child.label for child in view.children))
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    async def test_forwarded_video_attachment_offers_gif_conversion(self, _is_dm):
+        attachment = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/1/2/clip.mov",
+            filename="clip.mov",
+            content_type=None,
+            size=1024,
+        )
+        snapshot = SimpleNamespace(content="", attachments=[attachment], embeds=[])
+        message, _status = self._message(snapshots=[snapshot])
+
+        await create_client(_settings()).on_message(message)
+
+        view = message.reply.await_args.kwargs["view"]
+        self.assertTrue(any("GIF" in child.label for child in view.children))
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    async def test_oversized_video_attachment_is_rejected_before_download(self, _is_dm):
+        attachment = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/1/2/clip.mp4",
+            filename="clip.mp4",
+            content_type="video/mp4",
+            size=MAX_DOWNLOAD_BYTES + 1,
+        )
+        message, _status = self._message(attachments=[attachment])
+
+        await create_client(_settings()).on_message(message)
+
+        self.assertIn("too large", message.reply.await_args.args[0].lower())
+        self.assertNotIn("view", message.reply.await_args.kwargs)
+
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_attachment_conversion_sends_real_gif(self, download, convert):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        result = media_result([MediaItem("video", url, direct_url=url)])
+        view = MediaActionView(
+            owner_id=10, url=url, info={"_media": result},
+            settings=_settings(), attachment=True,
+        )
+        view._send_files = AsyncMock(return_value=True)
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10),
+            message=SimpleNamespace(edit=AsyncMock()),
+            response=SimpleNamespace(edit_message=AsyncMock()),
+        )
+        download.return_value = ["clip.mp4"]
+        convert.return_value = "clip.gif"
+
+        with patch("bot.discord_app.main.cleanup_files"):
+            await view._convert_gif(interaction)
+
+        convert.assert_awaited_once_with("clip.mp4", "0", "10.0")
+        view._send_files.assert_awaited_once_with(interaction, ["clip.gif"])
+
     @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
     async def test_download_button_finishes_instead_of_leaving_processing_status(self, download):
         url = "https://x.com/user/status/1"

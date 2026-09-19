@@ -72,11 +72,12 @@ A detailed Russian walkthrough is available in
 3. Set `DISCORD_ALLOWED_CHANNEL_IDS` to a comma-separated allowlist. An empty
    value disables all guild-channel processing. Set `DISCORD_ALLOW_DMS=false`
    to disable DMs; it defaults to `true`.
-4. Send a supported link in an allowed channel or DM. Only its author can use
-   the resulting controls. Album selects preserve source order; downloads are
-   split into configured attachment batches. Cancel remains available during a
-   long operation, and temporary files are removed after success, failure, or
-   cancellation.
+4. Send a supported link (including a forwarded message) in an allowed channel
+   or DM. Uploaded or forwarded video files offer a first-ten-seconds GIF
+   conversion. Only the sender can use the resulting controls. Album selects
+   preserve source order; downloads are split into configured attachment
+   batches. Cancel remains available during a long operation, and temporary
+   files are removed after success, failure, or cancellation.
 
 Discord exposes a guild-specific upload ceiling, which the adapter checks at
 send time. DMs use `DISCORD_FALLBACK_UPLOAD_MB` (20 MB by default). Discord notes

@@ -11,6 +11,7 @@ from typing import Any
 
 import discord
 
+from bot.config import MAX_DOWNLOAD_BYTES
 from bot.discord_app.config import DiscordSettings
 from bot.observability import (
     configure_logging,
@@ -18,12 +19,40 @@ from bot.observability import (
     log_media_failure,
     request_context,
 )
-from bot.services.converter import convert_to_gif
+from bot.services.converter import convert_to_discord_gif
 from bot.services.downloader import cleanup_files, download_media, extract_info
+from bot.services.media_model import MediaItem, media_result
 
 configure_logging()
 logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+VIDEO_SUFFIXES = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"})
+
+
+def _is_video_attachment(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    return (
+        content_type.startswith("video/")
+        or Path(attachment.filename).suffix.lower() in VIDEO_SUFFIXES
+    )
+
+
+def _incoming_media(message: discord.Message) -> tuple[str | None, discord.Attachment | None]:
+    """Look through the sent message and Discord's immutable forward snapshots."""
+    sources = (message, *getattr(message, "message_snapshots", ()))
+    for source in sources:
+        match = URL_PATTERN.search(getattr(source, "content", "") or "")
+        if match:
+            return match.group(0).rstrip(".,);]"), None
+        for attachment in getattr(source, "attachments", ()):
+            if _is_video_attachment(attachment):
+                return None, attachment
+    for source in sources:
+        for embed in getattr(source, "embeds", ()):
+            match = URL_PATTERN.search(getattr(embed, "url", "") or "")
+            if match:
+                return match.group(0).rstrip(".,);]"), None
+    return None, None
 
 
 class MediaActionView(discord.ui.View):
@@ -36,6 +65,7 @@ class MediaActionView(discord.ui.View):
         url: str,
         info: dict[str, Any],
         settings: DiscordSettings,
+        attachment: bool = False,
     ) -> None:
         super().__init__(timeout=15 * 60)
         self.owner_id = owner_id
@@ -47,7 +77,9 @@ class MediaActionView(discord.ui.View):
         result = info["_media"]
         item_count = len(result["items"])
 
-        if item_count > 1:
+        if attachment:
+            self._add_button("Convert to GIF (first 10s)", discord.ButtonStyle.primary, self._convert_gif)
+        elif item_count > 1:
             self._add_button("Download all", discord.ButtonStyle.primary, self._download_all)
             # Discord selects allow 25 options and a view has five component rows.
             # Four ordered selects plus the button row cover 100 children without
@@ -91,7 +123,7 @@ class MediaActionView(discord.ui.View):
         else:
             self._add_button("Download video", discord.ButtonStyle.primary, self._download_video)
             self._add_button("Extract audio", discord.ButtonStyle.secondary, self._download_audio)
-            self._add_button("Animation (first 10s)", discord.ButtonStyle.secondary, self._convert_gif)
+            self._add_button("Convert to GIF (first 10s)", discord.ButtonStyle.secondary, self._convert_gif)
         self.cancel_button = self._add_button(
             "Cancel", discord.ButtonStyle.danger, self._cancel
         )
@@ -175,14 +207,17 @@ class MediaActionView(discord.ui.View):
                 if action == "gif" and files:
                     source_path = files[0]
                     duration = self.info["_media"].get("duration") or 10
-                    animation = await convert_to_gif(
+                    animation = await convert_to_discord_gif(
                         source_path, "0", str(min(float(duration), 10))
                     )
                     cleanup_files(files)
                     files = [animation] if animation else []
                 if not files:
                     await self._notify(
-                        interaction, "The media could not be downloaded."
+                        interaction,
+                        "The GIF could not be created. Try a smaller video."
+                        if action == "gif"
+                        else "The media could not be downloaded.",
                     )
                     await self._finish(interaction, "Download failed.")
                     return
@@ -288,10 +323,36 @@ def create_client(settings: DiscordSettings) -> discord.Client:
             return
         if not settings.channel_allowed(message.channel.id, is_dm=_is_dm(message.channel)):
             return
-        match = URL_PATTERN.search(message.content or "")
-        if not match:
+        url, attachment = _incoming_media(message)
+        if attachment is not None:
+            if attachment.size > MAX_DOWNLOAD_BYTES:
+                limit_mb = MAX_DOWNLOAD_BYTES / (1024 * 1024)
+                await message.reply(
+                    f"Video is too large (maximum {limit_mb:g} MB).",
+                    mention_author=False,
+                )
+                return
+            url = attachment.url
+            result = media_result(
+                [MediaItem("video", url, direct_url=url)],
+                source_url=url,
+                provider="discord_attachment",
+            )
+            view = MediaActionView(
+                owner_id=message.author.id,
+                url=url,
+                info={"_media": result},
+                settings=settings,
+                attachment=True,
+            )
+            view.message = await message.reply(
+                "Video attached. Choose an action:",
+                mention_author=False,
+                view=view,
+            )
             return
-        url = match.group(0).rstrip(".,);]")
+        if url is None:
+            return
         status = await message.reply("Analyzing link…", mention_author=False)
         with log_context(**request_context(message, url, platform="discord")):
             try:

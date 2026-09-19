@@ -1,5 +1,5 @@
 aiogram>=3.4.0
-discord.py>=2.4.0,<3.0
+discord.py>=2.5.0,<3.0
 yt-dlp==2026.8.19
 ffmpeg-python>=0.2.0
 python-dotenv>=1.0.1
