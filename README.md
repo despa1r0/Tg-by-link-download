@@ -74,9 +74,11 @@ A detailed Russian walkthrough is available in
    to disable DMs; it defaults to `true`.
 4. Send a supported link (including a forwarded message) in an allowed channel
    or DM. Uploaded or forwarded video files offer GIF conversion with a
-   user-selected `START-END` range (seconds, `MM:SS`, or `HH:MM:SS`). Ranges
-   over ten seconds display a warning, and an oversized result is rejected
-   with the upload limit shown. Only the sender can use the resulting controls.
+   user-selected start and end times in separate modal fields (seconds, `MM:SS`,
+   or `HH:MM:SS`). Known video duration is shown in the prompt, and invalid or
+   out-of-range times are rejected before downloading. Ranges over ten seconds
+   display a warning; oversized results are rejected with the upload limit shown.
+   Only the sender can use the resulting controls.
    Album selects preserve source order; downloads are split into configured attachment
    batches. Cancel remains available during a long operation, and temporary
    files are removed after success, failure, or cancellation.

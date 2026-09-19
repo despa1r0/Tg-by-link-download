@@ -24,11 +24,26 @@ def parse_gif_range(value: str) -> tuple[str, str, int | float, int | float]:
     if not match:
         raise ValueError("Invalid format. Use START-END (for example 00:15-00:25 or 1-6).")
     start_time, end_time = match.groups()
-    start_seconds = _timestamp_to_seconds(start_time)
-    end_seconds = _timestamp_to_seconds(end_time)
+    start_seconds, end_seconds = parse_gif_times(start_time, end_time)
+    return start_time, end_time, start_seconds, end_seconds
+
+
+def parse_gif_times(start_time: str, end_time: str) -> tuple[int | float, int | float]:
+    """Validate separate Discord modal fields before starting a download."""
+    pattern = r"(?:[0-9]+(?:\.[0-9]+)?|[0-9]+:[0-9]+(?::[0-9]+)?)"
+    for label, value in (("Start", start_time), ("End", end_time)):
+        if not re.fullmatch(pattern, value.strip()):
+            raise ValueError(
+                f"Invalid {label.lower()} time. Use numbers in seconds, MM:SS, or HH:MM:SS."
+            )
+    try:
+        start_seconds = _timestamp_to_seconds(start_time.strip())
+        end_seconds = _timestamp_to_seconds(end_time.strip())
+    except ValueError as exc:
+        raise ValueError("Invalid timestamp. Minutes and seconds must be below 60.") from exc
     if end_seconds <= start_seconds:
         raise ValueError("End time must be after start time.")
-    return start_time, end_time, start_seconds, end_seconds
+    return start_seconds, end_seconds
 
 
 async def convert_to_gif(input_path: str, start_time: str, end_time: str) -> str | None:

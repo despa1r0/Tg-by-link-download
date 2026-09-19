@@ -13,10 +13,22 @@ from bot.services.converter import (
     _timestamp_to_seconds,
     convert_to_discord_gif,
     parse_gif_range,
+    parse_gif_times,
 )
 
 
 class TimestampTests(unittest.TestCase):
+    def test_discord_time_fields_reject_invalid_values(self):
+        self.assertEqual(parse_gif_times(" 01:05 ", "1:20"), (65, 80))
+        self.assertEqual(parse_gif_times("0.5", "7.5"), (0.5, 7.5))
+        for start, end in (
+            ("abc", "10"), ("0", "abc"), ("-1", "10"),
+            ("0", "NaN"), ("01:60", "02:00"), ("10", "10"),
+            ("20", "10"), ("", "10"),
+        ):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                parse_gif_times(start, end)
+
     def test_telegram_style_gif_range(self):
         self.assertEqual(parse_gif_range(" 00:15 - 00:35 "), ("00:15", "00:35", 15, 35))
         for value in ("", "15", "15:60-16:00", "5-5", "10-2", "a-b"):

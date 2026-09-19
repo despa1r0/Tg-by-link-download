@@ -89,6 +89,7 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             filename="clip.mp4",
             content_type="video/mp4",
             size=1024,
+            duration=95.5,
         )
         message, _status = self._message(attachments=[attachment])
 
@@ -98,6 +99,27 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
         view = message.reply.await_args.kwargs["view"]
         self.assertIsInstance(view, MediaActionView)
         self.assertTrue(any("GIF" in child.label for child in view.children))
+        self.assertIn("01:35.5", message.reply.await_args.args[0])
+        modal = GifRangeModal(view)
+        self.assertIn("01:35.5", modal.title)
+        self.assertEqual(modal.start_time.default, "0")
+        self.assertEqual(modal.end_time.default, "10")
+
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    async def test_link_video_duration_is_shown_and_used_as_default(self, extract, _is_dm):
+        url = "https://x.com/user/status/4"
+        extract.return_value = {
+            "_media": media_result([MediaItem("video", url, duration=7.533)])
+        }
+        message, status = self._message(content=url)
+
+        await create_client(_settings()).on_message(message)
+
+        self.assertIn("00:07.533", status.edit.await_args.kwargs["content"])
+        modal = GifRangeModal(status.edit.await_args.kwargs["view"])
+        self.assertIn("00:07.533", modal.title)
+        self.assertEqual(modal.end_time.default, "8")
 
     @patch("bot.discord_app.main._is_dm", return_value=True)
     async def test_forwarded_video_attachment_offers_gif_conversion(self, _is_dm):
@@ -114,6 +136,8 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
 
         view = message.reply.await_args.kwargs["view"]
         self.assertTrue(any("GIF" in child.label for child in view.children))
+        self.assertIn("Duration unavailable", message.reply.await_args.args[0])
+        self.assertIn("duration unknown", GifRangeModal(view).title)
 
     @patch("bot.discord_app.main._is_dm", return_value=True)
     async def test_oversized_video_attachment_is_rejected_before_download(self, _is_dm):
@@ -154,7 +178,8 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             await view._convert_gif(interaction)
             modal = interaction.response.send_modal.await_args.args[0]
             self.assertIsInstance(modal, GifRangeModal)
-            modal.time_range._value = "00:15-00:40"
+            modal.start_time._value = "00:15"
+            modal.end_time._value = "00:40"
             await modal.on_submit(interaction)
 
         interaction.response.defer.assert_awaited_once_with()
@@ -183,7 +208,8 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock()),
         )
         modal = GifRangeModal(view)
-        modal.time_range._value = "1-9"
+        modal.start_time._value = "1"
+        modal.end_time._value = "9"
         download.return_value = ["clip.mp4"]
         convert.return_value = "clip.gif"
 
@@ -208,11 +234,41 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(send_message=AsyncMock()),
         )
         modal = GifRangeModal(view)
-        modal.time_range._value = "20-10"
+        modal.start_time._value = "20"
+        modal.end_time._value = "10"
 
         await modal.on_submit(interaction)
 
         self.assertIn("End time", interaction.response.send_message.await_args.args[0])
+        download.assert_not_awaited()
+        self.assertFalse(view.is_finished())
+
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    async def test_gif_fields_reject_letters_and_out_of_bounds(self, download):
+        url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4"
+        result = media_result([MediaItem("video", url, direct_url=url, duration=60)])
+        view = MediaActionView(
+            owner_id=10, url=url, info={"_media": result},
+            settings=_settings(), attachment=True,
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=10),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+        for start, end, expected in (
+            ("abc", "10", "Invalid start time"),
+            ("0", "hello", "Invalid end time"),
+            ("01:60", "02:00", "Invalid timestamp"),
+            ("0", "61", "End time exceeds"),
+            ("60", "61", "Start time must be before"),
+        ):
+            with self.subTest(start=start, end=end):
+                modal = GifRangeModal(view)
+                modal.start_time._value = start
+                modal.end_time._value = end
+                await modal.on_submit(interaction)
+                self.assertIn(expected, interaction.response.send_message.await_args.args[0])
+
         download.assert_not_awaited()
         self.assertFalse(view.is_finished())
 
@@ -232,7 +288,8 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock()),
         )
         modal = GifRangeModal(view)
-        modal.time_range._value = "0-20"
+        modal.start_time._value = "0"
+        modal.end_time._value = "20"
         download.return_value = ["clip.mp4"]
         convert.side_effect = GifUploadLimitExceeded
 

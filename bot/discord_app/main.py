@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -22,7 +23,7 @@ from bot.observability import (
 from bot.services.converter import (
     GifUploadLimitExceeded,
     convert_to_discord_gif,
-    parse_gif_range,
+    parse_gif_times,
 )
 from bot.services.downloader import cleanup_files, download_media, extract_info
 from bot.services.media_model import MediaItem, media_result
@@ -31,6 +32,26 @@ configure_logging()
 logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 VIDEO_SUFFIXES = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"})
+
+
+def _known_video_duration(result: Any) -> float | None:
+    try:
+        duration = float(result.get("duration"))
+    except (TypeError, ValueError):
+        return None
+    return duration if math.isfinite(duration) and 0 < duration < 1_000_000_000_000 else None
+
+
+def _format_video_duration(duration: float) -> str:
+    milliseconds = math.floor(duration * 1000)
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, fraction = divmod(remainder, 1000)
+    formatted = (
+        f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        if hours else f"{minutes:02d}:{seconds:02d}"
+    )
+    return f"{formatted}.{fraction:03d}".rstrip("0") if fraction else formatted
 
 
 def _is_video_attachment(attachment: discord.Attachment) -> bool:
@@ -341,13 +362,25 @@ class GifRangeModal(discord.ui.Modal, title="Convert video to GIF"):
     def __init__(self, view: MediaActionView) -> None:
         super().__init__()
         self.media_view = view
-        self.time_range = discord.ui.TextInput(
-            label="Time range (START-END)",
-            placeholder="00:15-00:25 or 1-6",
-            default="0-10",
-            max_length=64,
+        duration = _known_video_duration(view.info["_media"])
+        if duration is not None:
+            self.title = f"Convert to GIF (video {_format_video_duration(duration)})"
+        else:
+            self.title = "Convert to GIF (duration unknown)"
+        self.start_time = discord.ui.TextInput(
+            label="Start time",
+            placeholder="Seconds, MM:SS, or HH:MM:SS",
+            default="0",
+            max_length=32,
         )
-        self.add_item(self.time_range)
+        self.end_time = discord.ui.TextInput(
+            label="End time",
+            placeholder="Seconds, MM:SS, or HH:MM:SS",
+            default=str(min(10, math.ceil(duration))) if duration is not None else "10",
+            max_length=32,
+        )
+        self.add_item(self.start_time)
+        self.add_item(self.end_time)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.media_view.owner_id:
@@ -361,11 +394,26 @@ class GifRangeModal(discord.ui.Modal, title="Convert video to GIF"):
             )
             return
         try:
-            start_time, end_time, start_seconds, end_seconds = parse_gif_range(
-                self.time_range.value
+            start_time = self.start_time.value.strip()
+            end_time = self.end_time.value.strip()
+            start_seconds, end_seconds = parse_gif_times(
+                start_time, end_time
             )
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        duration = _known_video_duration(self.media_view.info["_media"])
+        if duration is not None and start_seconds >= duration:
+            await interaction.response.send_message(
+                f"Start time must be before the video ends ({_format_video_duration(duration)}).",
+                ephemeral=True,
+            )
+            return
+        if duration is not None and end_seconds > math.ceil(duration):
+            await interaction.response.send_message(
+                f"End time exceeds the video duration ({_format_video_duration(duration)}).",
+                ephemeral=True,
+            )
             return
 
         await interaction.response.defer()
@@ -417,7 +465,14 @@ def create_client(settings: DiscordSettings) -> discord.Client:
                 return
             url = attachment.url
             result = media_result(
-                [MediaItem("video", url, direct_url=url)],
+                [
+                    MediaItem(
+                        "video",
+                        url,
+                        direct_url=url,
+                        duration=getattr(attachment, "duration", None),
+                    )
+                ],
                 source_url=url,
                 provider="discord_attachment",
             )
@@ -428,8 +483,13 @@ def create_client(settings: DiscordSettings) -> discord.Client:
                 settings=settings,
                 attachment=True,
             )
+            duration = _known_video_duration(result)
+            duration_note = (
+                f" Duration: {_format_video_duration(duration)}."
+                if duration is not None else " Duration unavailable."
+            )
             view.message = await message.reply(
-                "Video attached. Choose an action:",
+                f"Video attached.{duration_note} Choose an action:",
                 mention_author=False,
                 view=view,
             )
@@ -462,8 +522,15 @@ def create_client(settings: DiscordSettings) -> discord.Client:
             if count > 100
             else f" ({count} items)" if count > 1 else ""
         )
+        duration = _known_video_duration(result) if result["type"] == "video" else None
+        duration_note = ""
+        if result["type"] == "video":
+            duration_note = (
+                f" Duration: {_format_video_duration(duration)}."
+                if duration is not None else " Duration unavailable."
+            )
         await status.edit(
-            content=f"{result['type'].capitalize()} detected{suffix}. Choose an action:",
+            content=f"{result['type'].capitalize()} detected{suffix}.{duration_note} Choose an action:",
             view=view,
         )
         view.message = status
