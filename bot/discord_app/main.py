@@ -152,17 +152,18 @@ class MediaActionView(discord.ui.View):
         action: str,
         indices: list[int] | None = None,
     ) -> None:
-        self._disable(keep_cancel=True)
-        self.active_task = asyncio.current_task()
-        await interaction.response.edit_message(content="Processing media…", view=self)
         files: list[str] = []
+        context = request_context(interaction, self.url, platform="discord")
+        context["provider"] = self.info["_media"].get("provider") or context["provider"]
         with log_context(
-            **request_context(interaction, self.url, platform="discord"),
-            provider=self.info["_media"].get("provider"),
+            **context,
             download_stage="download_media",
             media_type=action,
         ):
             try:
+                self._disable(keep_cancel=True)
+                self.active_task = asyncio.current_task()
+                await interaction.response.edit_message(content="Processing media…", view=self)
                 selection = ",".join(str(index) for index in indices) if indices else None
                 download_action = "video" if action == "gif" else action
                 files = await download_media(
@@ -226,7 +227,7 @@ class MediaActionView(discord.ui.View):
     ) -> None:
         try:
             await interaction.followup.send(content, ephemeral=True)
-        except discord.NotFound:
+        except discord.HTTPException:
             # Follow-up tokens expire; a DM keeps long-operation errors private.
             try:
                 await interaction.user.send(content)

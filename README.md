@@ -126,6 +126,8 @@ records, and ships them to Loki. Records include `platform=telegram|discord`,
 the source provider, and operation stage. Loki persists data in its volume and
 is reachable only from the server itself at `http://127.0.0.1:3100` by default.
 It must remain behind an authenticated proxy if it is ever exposed remotely.
+The short-lived `loki-init` service gives the persistent volume to Loki's UID
+10001 before startup; it does not remove existing logs.
 
 Media failure events include the platform, operation stage, media type, error
 type and message, request ID, and safe URL metadata. URL paths, query strings,

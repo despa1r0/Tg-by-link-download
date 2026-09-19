@@ -11,6 +11,11 @@ GitHub Actions самостоятельно:
 - создаёт каталоги `observability`, `secrets` и `downloads`;
 - скачивает готовые образы и перезапускает сервисы.
 
+Перед запуском Loki одноразовый сервис `loki-init` выставляет владельца его
+постоянного Docker volume в `10001:10001`. Loki работает под UID 10001; без
+этого на некоторых VPS он не может создать `/tmp/loki/rules` и циклически
+перезапускается с `permission denied`. Сервис не удаляет данные volume.
+
 На VPS ничего не компилируется и репозиторий клонировать не нужно.
 
 ## 1. Один раз подготовить VPS
@@ -123,7 +128,7 @@ curl -G http://127.0.0.1:3100/loki/api/v1/query_range \
 Если что-то не запустилось:
 
 ```bash
-docker compose --profile discord logs --tail=200 bot discord loki alloy
+docker compose --profile discord logs --tail=200 bot discord loki-init loki alloy
 ```
 
 Логи хранятся 30 дней в Docker volume `loki-data`.
