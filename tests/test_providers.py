@@ -241,7 +241,7 @@ class DownloaderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(files, ["video.mp4"])
         normalize_url.assert_not_called()
-        ytdlp_download.assert_awaited_once_with(normalized_url, "video", None)
+        ytdlp_download.assert_awaited_once_with(normalized_url, "video", None, None)
 
     @patch("bot.services.downloader._download_direct_files", new_callable=AsyncMock)
     @patch("bot.services.downloader._run_sync", new_callable=AsyncMock)

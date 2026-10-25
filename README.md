@@ -73,10 +73,15 @@ A detailed Russian walkthrough is available in
    value disables all guild-channel processing. Set `DISCORD_ALLOW_DMS=false`
    to disable DMs; it defaults to `true`.
 4. Send a supported link (including a forwarded message) in an allowed channel
-   or DM. Uploaded or forwarded video files offer GIF conversion with a
-   full-video shortcut when the known duration is under 15 seconds. Longer
-   videos, or videos with unknown duration, use separate start and end modal
-   fields (seconds, `MM:SS`, or `HH:MM:SS`). Known duration is shown in the
+   or DM. When there is only one sensible action, the bot delivers immediately
+   without buttons: a single photo is sent as-is, and a GIF link is returned as
+   a real `.gif` (or the original clip, if the GIF would exceed the upload
+   limit). Video links offer Download video, Extract audio, and Convert to GIF,
+   like the Telegram bot; downloads pick an H.264/AAC format (up to 1080p) that
+   fits the channel's upload limit. Uploaded or forwarded video files under 15
+   seconds (duration is read with ffprobe) are converted to a GIF immediately.
+   Longer videos, or videos with unknown duration, use separate start and end
+   modal fields (seconds, `MM:SS`, or `HH:MM:SS`). Known duration is shown in the
    prompt, and invalid or out-of-range times are rejected before downloading.
    Ranges over ten seconds display a warning; oversized results are rejected
    with the upload limit shown.

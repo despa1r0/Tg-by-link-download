@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 import uuid
 
 import ffmpeg
@@ -212,6 +213,28 @@ async def convert_to_discord_gif(
                 if os.path.exists(output_path):
                     os.remove(output_path)
             raise
+
+
+async def probe_duration(source: str) -> float | None:
+    """Return a local file's or remote URL's duration in seconds, if ffprobe knows it."""
+    def _probe() -> float | None:
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    source,
+                ],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            duration = float(result.stdout.strip())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        return duration if math.isfinite(duration) and duration > 0 else None
+
+    context = contextvars.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(None, context.run, _probe)
 
 
 def _timestamp_to_seconds(value: str) -> int | float:

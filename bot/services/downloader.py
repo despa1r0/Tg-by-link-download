@@ -70,7 +70,10 @@ async def extract_info(url: str) -> dict | None:
 
 
 async def download_items(
-    items: Sequence[MediaItem | Mapping], indices: list[int] | None = None
+    items: Sequence[MediaItem | Mapping],
+    indices: list[int] | None = None,
+    *,
+    max_bytes: int | None = None,
 ) -> list[str]:
     """Download every selected child in source order, without silent partial albums."""
     files = []
@@ -79,7 +82,9 @@ async def download_items(
             continue
         if item.get("download") == "ytdlp":
             child = item.get("index")
-            paths = await ytdlp.download(item["url"], "video", str(child) if child else None)
+            paths = await ytdlp.download(
+                item["url"], "video", str(child) if child else None, max_bytes
+            )
         else:
             extension = "mp4"
             if item["type"] == "photo":
@@ -142,8 +147,13 @@ async def download_media(
     media_type: str,
     playlist_items: str | None = None,
     media_info: dict | None = None,
+    max_bytes: int | None = None,
 ) -> list[str]:
-    """Download video, audio, or gallery media from a supported URL."""
+    """Download video, audio, or gallery media from a supported URL.
+
+    ``max_bytes`` lets a destination with a smaller upload limit (Discord) ask
+    yt-dlp for a format that fits instead of the configured download maximum.
+    """
     detected: MediaResult | Mapping | None = (media_info or {}).get("_media")
     if not detected and not media_info and any(
         predicate(url)
@@ -161,9 +171,9 @@ async def download_media(
         if media_type == "audio":
             return await ytdlp.download(items[0]["url"], "audio", playlist_items)
         indices = [int(value) for value in playlist_items.split(",")] if playlist_items else None
-        return await download_items(items, indices)
+        return await download_items(items, indices, max_bytes=max_bytes)
 
     download_url = (media_info or {}).get("_download_url")
     if not download_url:
         download_url = tiktok.normalize_url(url) if tiktok.is_tiktok_url(url) else url
-    return await ytdlp.download(download_url, media_type, playlist_items)
+    return await ytdlp.download(download_url, media_type, playlist_items, max_bytes)

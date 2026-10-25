@@ -4,8 +4,12 @@ from bot.config import MAX_DOWNLOAD_BYTES
 from bot.services.providers.ytdlp import _select_video_format, _video_options
 
 
-def _format(format_id, *, video="none", audio="none", size=None, approx=None):
+def _format(
+    format_id, *, video="none", audio="none", size=None, approx=None, width=None, height=None
+):
     return {
+        "width": width,
+        "height": height,
         "format_id": format_id,
         "format": format_id,
         "ext": "mp4" if video != "none" else "m4a",
@@ -71,6 +75,54 @@ class VideoFormatSelectorTests(unittest.TestCase):
             list(_select_video_format({"formats": formats}, max_bytes=50)),
             [],
         )
+
+    def test_prefers_h264_aac_up_to_1080p_over_larger_av1(self):
+        # Mirrors YouTube Shorts, where AV1/VP9 offer 1440p and 4K streams.
+        formats = [
+            _format("aac", audio="mp4a.40.2", size=1),
+            _format("h264-720", video="avc1.4D401F", size=5, width=720, height=1280),
+            _format("h264-1080", video="avc1.640028", size=15, width=1080, height=1920),
+            _format("opus", audio="opus", size=1),
+            _format("vp9-1080", video="vp9", size=9, width=1080, height=1920),
+            _format("av1-2160", video="av01.0.12M.08", size=40, width=2160, height=3840),
+        ]
+
+        selected = list(_select_video_format({"formats": formats}, max_bytes=50))
+
+        self.assertEqual(selected[0]["format_id"], "h264-1080+aac")
+
+    def test_smaller_limit_selects_lower_compatible_resolution(self):
+        formats = [
+            _format("aac", audio="mp4a.40.2", size=1),
+            _format("h264-720", video="avc1.4D401F", size=5, width=720, height=1280),
+            _format("h264-1080", video="avc1.640028", size=15, width=1080, height=1920),
+        ]
+
+        selected = list(_select_video_format({"formats": formats}, max_bytes=10))
+
+        self.assertEqual(selected[0]["format_id"], "h264-720+aac")
+
+    def test_falls_back_to_other_codecs_with_audio_instead_of_silent_h264(self):
+        formats = [
+            _format("opus", audio="opus", size=1),
+            _format("h264-720", video="avc1.4D401F", size=5, width=720, height=1280),
+            _format("vp9-1080", video="vp9", size=9, width=1080, height=1920),
+        ]
+
+        selected = list(_select_video_format({"formats": formats}, max_bytes=50))
+
+        self.assertEqual(selected[0]["format_id"], "vp9-1080+opus")
+
+    def test_destination_limit_lowers_hard_limit(self):
+        options = _video_options(10)
+
+        self.assertEqual(options["max_filesize"], 10)
+        formats = [
+            _format("small", video="avc1", audio="mp4a", size=9),
+            _format("large", video="avc1", audio="mp4a", size=12),
+        ]
+        selected = list(options["format"]({"formats": formats}))
+        self.assertEqual(selected[0]["format_id"], "small")
 
 
 if __name__ == "__main__":

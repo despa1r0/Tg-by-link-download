@@ -33,6 +33,7 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             embeds=[],
             message_snapshots=list(snapshots),
             reply=AsyncMock(return_value=status),
+            guild=None,
         )
         return message, status
 
@@ -83,7 +84,7 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
 
     @patch("bot.discord_app.main._is_dm", return_value=True)
     @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
-    async def test_video_attachment_offers_gif_conversion(self, extract, _is_dm):
+    async def test_long_video_attachment_offers_gif_range(self, extract, _is_dm):
         attachment = SimpleNamespace(
             url="https://cdn.discordapp.com/attachments/1/2/clip.mp4",
             filename="clip.mp4",
@@ -121,8 +122,9 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("00:07.533", modal.title)
         self.assertEqual(modal.end_time.default, "8")
 
+    @patch("bot.discord_app.main.probe_duration", new_callable=AsyncMock, return_value=None)
     @patch("bot.discord_app.main._is_dm", return_value=True)
-    async def test_forwarded_video_attachment_offers_gif_conversion(self, _is_dm):
+    async def test_forwarded_video_attachment_offers_gif_conversion(self, _is_dm, _probe):
         attachment = SimpleNamespace(
             url="https://cdn.discordapp.com/attachments/1/2/clip.mov",
             filename="clip.mov",
@@ -153,6 +155,120 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("too large", message.reply.await_args.args[0].lower())
         self.assertNotIn("view", message.reply.await_args.kwargs)
+
+    @patch("bot.discord_app.main.cleanup_files")
+    @patch("bot.discord_app.main.os.path.getsize", return_value=1024)
+    @patch("bot.discord_app.main.discord.File")
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    async def test_single_photo_link_is_sent_without_buttons(
+        self, _is_dm, extract, download, _file, _getsize, _cleanup
+    ):
+        url = "https://x.com/user/status/5"
+        extract.return_value = {
+            "_media": media_result(
+                [MediaItem("photo", url, direct_url="https://pbs.twimg.com/a.jpg")]
+            )
+        }
+        download.return_value = ["photo.jpg"]
+        message, status = self._message(content=url)
+
+        await create_client(_settings()).on_message(message)
+
+        download.assert_awaited_once()
+        self.assertEqual(download.await_args.args[1], "photo")
+        self.assertIn("files", message.reply.await_args.kwargs)
+        for call in status.edit.await_args_list:
+            self.assertNotIn("view", call.kwargs)
+        self.assertEqual(status.edit.await_args.kwargs["content"], "Done.")
+
+    @patch("bot.discord_app.main.cleanup_files")
+    @patch("bot.discord_app.main.os.path.getsize", return_value=1024)
+    @patch("bot.discord_app.main.discord.File")
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    async def test_gif_link_is_converted_to_gif_without_buttons(
+        self, _is_dm, extract, download, convert, _file, _getsize, _cleanup
+    ):
+        url = "https://x.com/user/status/6"
+        extract.return_value = {
+            "_media": media_result(
+                [MediaItem("gif", url, direct_url="https://video.twimg.com/a.mp4")]
+            )
+        }
+        download.return_value = ["source.mp4"]
+        convert.return_value = "animation.gif"
+        message, status = self._message(content=url)
+
+        with patch(
+            "bot.discord_app.main.probe_duration", new_callable=AsyncMock, return_value=4.2
+        ):
+            await create_client(_settings()).on_message(message)
+
+        convert.assert_awaited_once_with(
+            "source.mp4", "0", "4.2", max_output_bytes=10 * 1024 * 1024
+        )
+        _file.assert_called_once_with("animation.gif", filename="animation.gif")
+        self.assertEqual(status.edit.await_args.kwargs["content"], "Done.")
+
+    @patch("bot.discord_app.main.cleanup_files")
+    @patch("bot.discord_app.main.os.path.getsize", return_value=1024)
+    @patch("bot.discord_app.main.discord.File")
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.extract_info", new_callable=AsyncMock)
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    async def test_oversized_gif_falls_back_to_original_clip(
+        self, _is_dm, extract, download, convert, _file, _getsize, _cleanup
+    ):
+        url = "https://x.com/user/status/7"
+        extract.return_value = {
+            "_media": media_result(
+                [MediaItem("gif", url, direct_url="https://video.twimg.com/a.mp4", duration=30)]
+            )
+        }
+        download.side_effect = [["source.mp4"], ["clip.mp4"]]
+        convert.side_effect = GifUploadLimitExceeded
+        message, status = self._message(content=url)
+
+        await create_client(_settings()).on_message(message)
+
+        self.assertEqual(download.await_count, 2)
+        self.assertEqual(download.await_args.kwargs["max_bytes"], 10 * 1024 * 1024)
+        _file.assert_called_once_with("clip.mp4", filename="clip.mp4")
+        self.assertIn("original clip", status.edit.await_args.kwargs["content"])
+
+    @patch("bot.discord_app.main.cleanup_files")
+    @patch("bot.discord_app.main.os.path.getsize", return_value=1024)
+    @patch("bot.discord_app.main.discord.File")
+    @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
+    @patch("bot.discord_app.main.probe_duration", new_callable=AsyncMock, return_value=6.5)
+    @patch("bot.discord_app.main._is_dm", return_value=True)
+    async def test_short_attachment_converts_to_gif_without_buttons(
+        self, _is_dm, probe, download, convert, _file, _getsize, _cleanup
+    ):
+        attachment = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/1/2/clip.mp4",
+            filename="clip.mp4",
+            content_type="video/mp4",
+            size=1024,
+        )
+        download.return_value = ["clip.mp4"]
+        convert.return_value = "clip.gif"
+        message, status = self._message(attachments=[attachment])
+
+        await create_client(_settings()).on_message(message)
+
+        probe.assert_awaited_once_with(attachment.url)
+        convert.assert_awaited_once_with(
+            "clip.mp4", "0", "6.5", max_output_bytes=10 * 1024 * 1024
+        )
+        self.assertNotIn("view", message.reply.await_args_list[0].kwargs)
+        self.assertEqual(status.edit.await_args.kwargs["content"], "Done.")
 
     @patch("bot.discord_app.main.convert_to_discord_gif", new_callable=AsyncMock)
     @patch("bot.discord_app.main.download_media", new_callable=AsyncMock)
@@ -380,7 +496,11 @@ class DiscordViewTests(unittest.IsolatedAsyncioTestCase):
             await view._download_video(interaction)
 
         download.assert_awaited_once_with(
-            url, "video", playlist_items=None, media_info={"_media": result}
+            url,
+            "video",
+            playlist_items=None,
+            media_info={"_media": result},
+            max_bytes=10 * 1024 * 1024,
         )
         view._send_files.assert_awaited_once_with(interaction, ["file.mp4"])
         self.assertEqual(interaction.message.edit.await_args.kwargs["content"], "Done.")

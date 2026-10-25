@@ -24,6 +24,7 @@ from bot.services.converter import (
     GifUploadLimitExceeded,
     convert_to_discord_gif,
     parse_gif_times,
+    probe_duration,
 )
 from bot.services.downloader import cleanup_files, download_media, extract_info
 from bot.services.media_model import MediaItem, media_result
@@ -32,6 +33,12 @@ configure_logging()
 logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 VIDEO_SUFFIXES = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"})
+# Videos shorter than this convert in full; longer ones ask for a time range.
+FULL_GIF_MAX_SECONDS = 15
+LONG_GIF_WARNING = (
+    "⚠️ A longer animation may take more time, lose some quality, or exceed "
+    "Discord's file-size limit. I will still convert the full range."
+)
 
 
 def _known_video_duration(result: Any) -> float | None:
@@ -80,6 +87,122 @@ def _incoming_media(message: discord.Message) -> tuple[str | None, discord.Attac
     return None, None
 
 
+def _upload_limit(guild: Any, settings: DiscordSettings) -> int:
+    return getattr(guild, "filesize_limit", None) or settings.fallback_upload_bytes
+
+
+async def _produce_files(
+    url: str,
+    info: dict[str, Any],
+    action: str,
+    *,
+    upload_limit: int,
+    indices: list[int] | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> list[str]:
+    """Download media for *action*; a GIF replaces its downloaded source video.
+
+    Raises ``GifUploadLimitExceeded`` when the animation cannot fit the limit.
+    """
+    selection = ",".join(str(index) for index in indices) if indices else None
+    files = await download_media(
+        url,
+        "video" if action == "gif" else action,
+        playlist_items=selection,
+        media_info=info,
+        # GIF sources only need to fit the download cap; their output is checked.
+        max_bytes=upload_limit if action == "video" else None,
+    )
+    if action != "gif" or not files:
+        return files
+    try:
+        if end_time is None:
+            duration = _known_video_duration(info["_media"]) or await probe_duration(files[0])
+            if duration is None:
+                return []
+            end_time = str(duration)
+        animation = await convert_to_discord_gif(
+            files[0], start_time or "0", end_time, max_output_bytes=upload_limit
+        )
+    finally:
+        cleanup_files(files)
+    return [animation] if animation else []
+
+
+async def _deliver_instantly(
+    message: discord.Message,
+    status: discord.Message,
+    url: str,
+    info: dict[str, Any],
+    settings: DiscordSettings,
+    action: str,
+    *,
+    end_time: str | None = None,
+    note: str = "",
+) -> None:
+    """Deliver a result that needs no user choice, without buttons.
+
+    A GIF that does not fit the upload limit falls back to the source video.
+    """
+    upload_limit = _upload_limit(message.guild, settings)
+    limit_mb = upload_limit / (1024 * 1024)
+    files: list[str] = []
+    context = request_context(message, url, platform="discord")
+    context["provider"] = info["_media"].get("provider") or context["provider"]
+    with log_context(**context, download_stage="download_media", media_type=action):
+        try:
+            await status.edit(content=f"Processing media…{note}")
+            try:
+                files = await _produce_files(
+                    url, info, action, upload_limit=upload_limit, end_time=end_time
+                )
+            except GifUploadLimitExceeded:
+                files = await _produce_files(url, info, "video", upload_limit=upload_limit)
+                note = (
+                    f" The GIF would exceed this channel's upload limit ({limit_mb:g} MB), "
+                    "so the original clip was sent instead."
+                )
+            else:
+                note = ""
+            if not files:
+                await status.edit(
+                    content="The GIF could not be created. Try a smaller video."
+                    if action == "gif"
+                    else "The media could not be downloaded."
+                )
+                return
+            if any(os.path.getsize(path) > upload_limit for path in files):
+                await status.edit(
+                    content=f"The result exceeds this channel's upload limit ({limit_mb:g} MB)."
+                )
+                return
+            chunk_size = settings.attachments_per_message
+            for start in range(0, len(files), chunk_size):
+                await message.reply(
+                    files=[
+                        discord.File(path, filename=Path(path).name)
+                        for path in files[start : start + chunk_size]
+                    ],
+                    mention_author=False,
+                )
+            await status.edit(content=f"Done.{note}")
+        except Exception as exc:
+            log_media_failure(
+                logger,
+                stage="discord_delivery",
+                error=exc,
+                url=url,
+                media_type=action,
+            )
+            try:
+                await status.edit(content="The operation failed. Please try the link again.")
+            except discord.HTTPException:
+                pass
+        finally:
+            cleanup_files(files)
+
+
 class MediaActionView(discord.ui.View):
     """Per-message controls that can only be used by the initiating user."""
 
@@ -104,7 +227,7 @@ class MediaActionView(discord.ui.View):
         duration = _known_video_duration(result)
         gif_label = (
             "Convert full video to GIF"
-            if duration is not None and duration < 15 else "Convert to GIF"
+            if duration is not None and duration < FULL_GIF_MAX_SECONDS else "Convert to GIF"
         )
 
         if attachment:
@@ -147,9 +270,6 @@ class MediaActionView(discord.ui.View):
                 self.add_item(select)
         elif result["type"] == "photo":
             self._add_button("Download photo", discord.ButtonStyle.primary, self._download_photo)
-        elif result["type"] == "gif":
-            self._add_button("Download animation", discord.ButtonStyle.primary, self._download_video)
-            self._add_button("Extract audio", discord.ButtonStyle.secondary, self._download_audio)
         else:
             self._add_button("Download video", discord.ButtonStyle.primary, self._download_video)
             self._add_button("Extract audio", discord.ButtonStyle.secondary, self._download_audio)
@@ -204,7 +324,7 @@ class MediaActionView(discord.ui.View):
             )
             return
         duration = _known_video_duration(self.info["_media"])
-        if duration is not None and duration < 15:
+        if duration is not None and duration < FULL_GIF_MAX_SECONDS:
             await self._deliver(
                 interaction,
                 "gif",
@@ -257,29 +377,16 @@ class MediaActionView(discord.ui.View):
                 else:
                     await interaction.response.edit_message(content="Processing media…", view=self)
                 if warn_long_gif:
-                    await self._notify(
-                        interaction,
-                        "⚠️ A longer animation may take more time, lose some quality, or exceed "
-                        "Discord's file-size limit. I will still convert the full range.",
-                    )
-                selection = ",".join(str(index) for index in indices) if indices else None
-                download_action = "video" if action == "gif" else action
-                files = await download_media(
+                    await self._notify(interaction, LONG_GIF_WARNING)
+                files = await _produce_files(
                     self.url,
-                    download_action,
-                    playlist_items=selection,
-                    media_info=self.info,
+                    self.info,
+                    action,
+                    upload_limit=self._upload_limit(interaction),
+                    indices=indices,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
-                if action == "gif" and files:
-                    source_path = files[0]
-                    animation = await convert_to_discord_gif(
-                        source_path,
-                        start_time,
-                        end_time,
-                        max_output_bytes=self._upload_limit(interaction),
-                    )
-                    cleanup_files(files)
-                    files = [animation] if animation else []
                 if not files:
                     await self._notify(
                         interaction,
@@ -376,8 +483,7 @@ class MediaActionView(discord.ui.View):
         return True
 
     def _upload_limit(self, interaction: discord.Interaction) -> int:
-        guild_limit = getattr(getattr(interaction, "guild", None), "filesize_limit", None)
-        return guild_limit or self.settings.fallback_upload_bytes
+        return _upload_limit(getattr(interaction, "guild", None), self.settings)
 
 
 class GifRangeModal(discord.ui.Modal, title="Convert video to GIF"):
@@ -481,18 +587,30 @@ def create_client(settings: DiscordSettings) -> discord.Client:
                 )
                 return
             url = attachment.url
+            # Discord only reports duration for voice messages; ask ffprobe so
+            # short uploads can convert without a time-range prompt.
+            duration = getattr(attachment, "duration", None) or await probe_duration(url)
             result = media_result(
-                [
-                    MediaItem(
-                        "video",
-                        url,
-                        direct_url=url,
-                        duration=getattr(attachment, "duration", None),
-                    )
-                ],
+                [MediaItem("video", url, direct_url=url, duration=duration)],
                 source_url=url,
                 provider="discord_attachment",
             )
+            duration = _known_video_duration(result)
+            if duration is not None and duration < FULL_GIF_MAX_SECONDS:
+                status = await message.reply(
+                    "Converting video to GIF…", mention_author=False
+                )
+                await _deliver_instantly(
+                    message,
+                    status,
+                    url,
+                    {"_media": result},
+                    settings,
+                    "gif",
+                    end_time=str(duration),
+                    note=f" {LONG_GIF_WARNING}" if duration > 10 else "",
+                )
+                return
             view = MediaActionView(
                 owner_id=message.author.id,
                 url=url,
@@ -500,13 +618,12 @@ def create_client(settings: DiscordSettings) -> discord.Client:
                 settings=settings,
                 attachment=True,
             )
-            duration = _known_video_duration(result)
             duration_note = (
                 f" Duration: {_format_video_duration(duration)}."
                 if duration is not None else " Duration unavailable."
             )
             view.message = await message.reply(
-                f"Video attached.{duration_note} Choose an action:",
+                f"Video attached.{duration_note} Choose a time range for the GIF:",
                 mention_author=False,
                 view=view,
             )
@@ -527,6 +644,10 @@ def create_client(settings: DiscordSettings) -> discord.Client:
             return
 
         result = info["_media"]
+        # A single photo or GIF has only one sensible action: deliver it now.
+        if result["type"] in {"photo", "gif"}:
+            await _deliver_instantly(message, status, url, info, settings, result["type"])
+            return
         view = MediaActionView(
             owner_id=message.author.id,
             url=url,
