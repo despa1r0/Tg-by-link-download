@@ -113,6 +113,23 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(media["type"], "video")
         self.assertEqual(media["url"], "https://eeinstagram.com/videos/abc/1")
 
+    @patch("bot.services.providers.instagram.urllib.request.urlopen")
+    def test_instagram_proxy_video_label_on_photo_carousel_is_a_photo(self, urlopen):
+        page = '<meta property="og:video" content="/videos/abc/3?audio=1">'
+        photo = FakeResponse("", url="https://cdn.test/photo3.jpg", content_type="image/jpeg")
+        urlopen.side_effect = [
+            OSError("proxy unavailable"),
+            FakeResponse(page, url="https://eeinstagram.com/p/abc/?img_index=3"),
+            photo,
+            FakeResponse(page, url="https://kkinstagram.com/p/abc/?img_index=3"),
+            photo,
+        ]
+
+        media = instagram.extract_proxy_media("https://www.instagram.com/p/abc/?img_index=3")
+
+        self.assertEqual(media["type"], "photo")
+        self.assertEqual(media["url"], "https://cdn.test/photo3.jpg")
+
     @patch("bot.services.providers.twitter.urllib.request.urlopen")
     def test_twitter_animated_gif_is_classified_as_gif(self, urlopen):
         payload = {

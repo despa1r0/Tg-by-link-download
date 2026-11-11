@@ -87,13 +87,15 @@ def extract_proxy_media(url: str) -> MediaResult | None:
             None,
         )
         if video_url:
-            return media_result(
+            video_url = urllib.parse.urljoin(proxy_url, html_module.unescape(video_url))
+            # Some proxies advertise og:video for every post, including photo
+            # carousels, and redirect that "video" to a JPEG. Trust the bytes.
+            media_type, resolved_url = _probe_media(video_url)
+            result = media_result(
                 [MediaItem(
-                    "video",
+                    "photo" if media_type == "photo" else "video",
                     url,
-                    direct_url=urllib.parse.urljoin(
-                        proxy_url, html_module.unescape(video_url)
-                    ),
+                    direct_url=resolved_url,
                 )],
                 html_module.unescape(
                     _meta_content(page, "og:title") or "Instagram Media"
@@ -101,6 +103,11 @@ def extract_proxy_media(url: str) -> MediaResult | None:
                 source_url=url,
                 provider="instagram",
             )
+            if media_type != "photo":
+                return result
+            if not re.search(r"/(?:reel|reels|tv)/", parsed.path):
+                photo_fallback = photo_fallback or result
+            continue
         image_url = _meta_content(page, "og:image")
         # An OG image alone is often a video poster, not a downloadable photo.
         if image_url and (_meta_content(page, "og:type") or "").lower() in {"image", "photo"} and not re.search(r"/(?:reel|reels|tv)/", parsed.path):
@@ -193,6 +200,22 @@ def _meta_content(page: str, property_name: str) -> str | None:
         if match := re.search(pattern, page, re.IGNORECASE):
             return match.group(1)
     return None
+
+
+def _probe_media(url: str) -> tuple[str | None, str]:
+    """Follow a media link and classify it by its response, not by its label."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": EMBED_USER_AGENT, "Range": "bytes=0-0"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            final_url = response.url
+            media_type = _response_media_type(response, final_url)
+    except Exception as exc:
+        logger.warning("Instagram media probe failed: %s", exc)
+        return None, url
+    # Keep the proxy URL for videos: it can merge separate audio on download.
+    return media_type, final_url if media_type == "photo" else url
 
 
 def _response_media_type(response, url: str) -> str | None:
