@@ -1,6 +1,6 @@
 aiogram>=3.4.0
 discord.py>=2.5.0,<3.0
-yt-dlp==2026.10.26
+yt-dlp[curl-cffi]==2026.10.26
 ffmpeg-python>=0.2.0
 python-dotenv>=1.0.1
 aiofiles>=23.2.1
